@@ -267,16 +267,6 @@ class CampaignPublicView(discord.ui.View):
         )
         participants.callback = self.show_participants
         self.add_item(participants)
-        draw = discord.ui.Button(
-            label="Fazer sorteio",
-            emoji="🎁",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"campaign:{campaign_id}:draw",
-            row=1,
-        )
-        draw.callback = self.draw
-        self.add_item(draw)
-
     async def join(self, interaction: discord.Interaction):
         if not interaction.guild_id:
             await interaction.response.send_message("Use este botão dentro do servidor.", ephemeral=True)
@@ -320,17 +310,6 @@ class CampaignPublicView(discord.ui.View):
             color=0x5865F2,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def draw(self, interaction: discord.Interaction):
-        if not interaction.guild or not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "Somente administradores podem iniciar o sorteio.", ephemeral=True
-            )
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        message = await draw_campaign(self.bot, self.campaign_id)
-        await interaction.followup.send(message, ephemeral=True)
-
 
 async def draw_campaign(bot, campaign_id: int) -> str:
     import secrets
