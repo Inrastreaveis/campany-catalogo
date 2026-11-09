@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 
 async def active_campaign(session, guild_id: int):
+    """Compatibility helper for legacy code; prefer explicit campaign IDs."""
     result = await session.execute(
         select(Campaign).where(
             Campaign.guild_id == guild_id,
@@ -27,6 +28,15 @@ async def active_campaign(session, guild_id: int):
         ).order_by(Campaign.created_at.desc())
     )
     return result.scalars().first()
+
+
+async def campaign_for_guild(session, guild_id: int, campaign_id: int, active_only: bool = True):
+    campaign = await session.get(Campaign, campaign_id)
+    if campaign is None or campaign.guild_id != guild_id:
+        return None
+    if active_only and not campaign.is_active:
+        return None
+    return campaign
 
 
 class CampaignCommands(commands.Cog):
@@ -80,10 +90,8 @@ class CampaignCommands(commands.Cog):
 
         try:
             async with self.bot.db.sessions() as session:
-                old = await active_campaign(session, interaction.guild_id)
-                old_campaign_id = old.id if old else None
-                if old:
-                    old.is_active = False
+                # Each campaign owns its own public panel and participant list.
+                # Creating a new campaign must not deactivate existing campaigns.
                 campaign = Campaign(
                     guild_id=interaction.guild_id,
                     asset_id=item_id,
@@ -110,8 +118,6 @@ class CampaignCommands(commands.Cog):
                 campaign.message_id = message.id
                 await session.commit()
                 campaign_id = campaign.id
-            if old_campaign_id:
-                await refresh_campaign_message(self.bot, old_campaign_id)
             self.bot.add_view(CampaignPublicView(self.bot, campaign_id, item_id), message_id=message.id)
             await interaction.followup.send(
                 f"✅ Campanha criada e publicada em {canal.mention}.\n"
@@ -128,10 +134,11 @@ class CampaignCommands(commands.Cog):
             log.exception("Falha ao criar campanha")
             await interaction.followup.send("Erro ao criar a campanha. Consulte os logs do bot.", ephemeral=True)
 
-    @app_commands.command(name="campanha_editar", description="Edita item, meta, prêmio, vagas e prazo da campanha ativa.")
+    @app_commands.command(name="campanha_editar", description="Edita uma campanha específica pelo ID.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
+        campanha_id="ID da campanha que deseja editar (visível no painel Gerenciar campanhas)",
         item_id="Novo ID Roblox (opcional)",
         meta="Nova meta de favoritos",
         premio="Novo prêmio",
@@ -141,6 +148,7 @@ class CampaignCommands(commands.Cog):
     async def edit(
         self,
         interaction: discord.Interaction,
+        campanha_id: app_commands.Range[int, 1, 9_007_199_254_740_991],
         item_id: app_commands.Range[int, 1, 9_007_199_254_740_991] | None = None,
         meta: app_commands.Range[int, 1, 2_000_000_000] | None = None,
         premio: str | None = None,
@@ -167,9 +175,9 @@ class CampaignCommands(commands.Cog):
                 return
 
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, interaction.guild_id)
+            campaign = await campaign_for_guild(session, interaction.guild_id, campanha_id)
             if campaign is None:
-                await interaction.followup.send("Não existe campanha ativa.", ephemeral=True)
+                await interaction.followup.send("Campanha não encontrada ou não está ativa neste servidor.", ephemeral=True)
                 return
             winners_result = await session.execute(
                 select(func.count(CampaignWinner.id)).where(CampaignWinner.campaign_id == campaign.id)
@@ -213,16 +221,21 @@ class CampaignCommands(commands.Cog):
         await refresh_campaign_message(self.bot, campaign_id)
         await interaction.followup.send("✅ Configurações da campanha atualizadas. O painel existente foi editado.", ephemeral=True)
 
-    @app_commands.command(name="campanha_participantes", description="Mostra os participantes confirmados da campanha ativa.")
+    @app_commands.command(name="campanha_participantes", description="Mostra participantes de uma campanha específica.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    async def participants(self, interaction: discord.Interaction):
+    @app_commands.describe(campanha_id="ID da campanha que deseja consultar")
+    async def participants(
+        self,
+        interaction: discord.Interaction,
+        campanha_id: app_commands.Range[int, 1, 9_007_199_254_740_991],
+    ):
         if not await self._admin(interaction):
             return
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, interaction.guild_id)
+            campaign = await campaign_for_guild(session, interaction.guild_id, campanha_id)
             if campaign is None:
-                await interaction.response.send_message("Não existe campanha ativa.", ephemeral=True)
+                await interaction.response.send_message("Campanha não encontrada ou não está ativa neste servidor.", ephemeral=True)
                 return
             result = await session.execute(
                 select(CampaignParticipant).where(
@@ -246,38 +259,46 @@ class CampaignCommands(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="campanha_sortear", description="Executa o sorteio quando a meta de favoritos for atingida.")
+    @app_commands.command(name="campanha_sortear", description="Sorteia uma campanha específica quando a meta for atingida.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    async def draw(self, interaction: discord.Interaction):
+    @app_commands.describe(campanha_id="ID da campanha que deseja sortear")
+    async def draw(
+        self,
+        interaction: discord.Interaction,
+        campanha_id: app_commands.Range[int, 1, 9_007_199_254_740_991],
+    ):
         if not await self._admin(interaction):
             return
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, interaction.guild_id)
-            campaign_id = campaign.id if campaign else None
-        if campaign_id is None:
-            await interaction.response.send_message("Não existe campanha ativa.", ephemeral=True)
-            return
+            campaign = await campaign_for_guild(session, interaction.guild_id, campanha_id)
+            if campaign is None:
+                await interaction.response.send_message("Campanha não encontrada ou não está ativa neste servidor.", ephemeral=True)
+                return
         await interaction.response.defer(ephemeral=True, thinking=True)
         result = await draw_campaign(self.bot, campaign_id)
         await interaction.followup.send(result, ephemeral=True)
 
-    @app_commands.command(name="campanha_substituir", description="Sorteia um substituto para uma vaga cujo ganhador não respondeu.")
+    @app_commands.command(name="campanha_substituir", description="Sorteia um substituto em uma campanha específica.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(posicao="Número da posição que precisa de substituto (1º, 2º, 3º...)")
+    @app_commands.describe(
+        campanha_id="ID da campanha",
+        posicao="Número da posição que precisa de substituto (1º, 2º, 3º...)",
+    )
     async def replace_winner(
         self,
         interaction: discord.Interaction,
+        campanha_id: app_commands.Range[int, 1, 9_007_199_254_740_991],
         posicao: app_commands.Range[int, 1, 20],
     ):
         if not await self._admin(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, interaction.guild_id)
+            campaign = await campaign_for_guild(session, interaction.guild_id, campanha_id)
             if campaign is None:
-                await interaction.followup.send("Não existe campanha ativa.", ephemeral=True)
+                await interaction.followup.send("Campanha não encontrada ou não está ativa neste servidor.", ephemeral=True)
                 return
             result = await session.execute(
                 select(CampaignWinner).where(
@@ -354,19 +375,23 @@ class CampaignCommands(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="campanha_encerrar", description="Encerra a campanha ativa.")
+    @app_commands.command(name="campanha_encerrar", description="Encerra uma campanha específica.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    async def close_campaign(self, interaction: discord.Interaction):
+    @app_commands.describe(campanha_id="ID da campanha que deseja encerrar")
+    async def close_campaign(
+        self,
+        interaction: discord.Interaction,
+        campanha_id: app_commands.Range[int, 1, 9_007_199_254_740_991],
+    ):
         if not await self._admin(interaction):
             return
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, interaction.guild_id)
+            campaign = await campaign_for_guild(session, interaction.guild_id, campanha_id)
             if campaign is None:
-                await interaction.response.send_message("Não existe campanha ativa.", ephemeral=True)
+                await interaction.response.send_message("Campanha não encontrada ou não está ativa neste servidor.", ephemeral=True)
                 return
             campaign.is_active = False
-            campaign_id = campaign.id
             await session.commit()
         await refresh_campaign_message(self.bot, campaign_id)
         await interaction.response.send_message("Campanha encerrada. O painel foi mantido no canal, mas as inscrições foram fechadas.", ephemeral=True)
