@@ -40,6 +40,17 @@ class CampaignAdminView(discord.ui.View):
             action=f"painel:{self.__class__.__name__}"
         )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        log.exception("Erro em interação do painel de campanhas", exc_info=error)
+        message = "Ocorreu um erro ao executar esta ação. Consulte os logs do bot."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            log.exception("Não foi possível informar o erro ao administrador")
+
     @discord.ui.button(label="Criar campanha", emoji="🎁", style=discord.ButtonStyle.success, row=0)
     async def create_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
@@ -157,12 +168,10 @@ class CampaignChannelSelect(discord.ui.ChannelSelect):
         if guild is None or guild.id != self.parent.guild_id or selected_id is None:
             await interaction.response.send_message("Não consegui identificar o canal deste servidor.", ephemeral=True)
             return
-        channel = guild.get_channel(int(selected_id))
-        if channel is None:
-            try:
-                channel = await guild.fetch_channel(int(selected_id))
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                channel = None
+        # ChannelSelect resolves the selected guild channel for us. Avoid a
+        # network fetch before opening the modal, because a modal must be the
+        # interaction's first response and Discord enforces a 3-second deadline.
+        channel = selected if isinstance(selected, discord.TextChannel) else guild.get_channel(int(selected_id))
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Selecione um canal de texto deste servidor.", ephemeral=True)
             return
