@@ -200,24 +200,35 @@ class DashboardView(AdminView):
 
     @discord.ui.button(label="Campanhas e sorteios", emoji="🎁", style=discord.ButtonStyle.success, row=2)
     async def campaigns(self, interaction: discord.Interaction, button: discord.ui.Button):
-        async with self.bot.db.sessions() as session:
-            from src.ui.campaign_admin import active_campaign
-            campaign = await active_campaign(session, self.guild_id)
-        if campaign:
-            status = (
-                f"**Campanha ativa:** {campaign.item_name}\\n"
-                f"**ID do item:** `{campaign.asset_id}`\\n"
-                f"**Favoritos:** {campaign.favorite_count:,} / {campaign.target_favorites:,}\\n"
-                f"**Prêmio:** {campaign.prize_text}\\n"
-                f"**Ganhadores:** {campaign.winner_count}\\n\\n"
-            ).replace(",", ".")
-        else:
-            status = "**Nenhuma campanha ativa no momento.**\\n\\n"
-        await interaction.response.edit_message(
-            content=status + "Gerencie a campanha e os sorteios diretamente por este painel.",
-            embed=None,
-            view=CampaignAdminView(self.bot, self.owner_id, self.guild_id),
-        )
+        # Acknowledge the component immediately: the database lookup may take longer
+        # than Discord's 3-second interaction deadline on a cold connection.
+        await interaction.response.defer()
+        try:
+            async with self.bot.db.sessions() as session:
+                from src.ui.campaign_admin import active_campaign
+                campaign = await active_campaign(session, self.guild_id)
+            if campaign:
+                status = (
+                    f"**Campanha ativa:** {campaign.item_name}\n"
+                    f"**ID do item:** `{campaign.asset_id}`\n"
+                    f"**Favoritos:** {campaign.favorite_count:,} / {campaign.target_favorites:,}\n"
+                    f"**Prêmio:** {campaign.prize_text}\n"
+                    f"**Ganhadores:** {campaign.winner_count}\n\n"
+                ).replace(",", ".")
+            else:
+                status = "**Nenhuma campanha ativa no momento.**\n\n"
+            await interaction.edit_original_response(
+                content=status + "Gerencie a campanha e os sorteios diretamente por este painel.",
+                embed=None,
+                view=CampaignAdminView(self.bot, self.owner_id, self.guild_id),
+            )
+        except Exception:
+            log.exception("Falha ao abrir o painel de campanhas no /configcatalogo")
+            await interaction.edit_original_response(
+                content="Não consegui abrir as campanhas. Verifique os logs do bot e tente novamente.",
+                embed=None,
+                view=CampaignAdminView(self.bot, self.owner_id, self.guild_id),
+            )
 
     @discord.ui.button(label="Fechar", emoji="🔒", style=discord.ButtonStyle.danger, row=1)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
