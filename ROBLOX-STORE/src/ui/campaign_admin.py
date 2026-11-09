@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -207,13 +208,26 @@ class CreateCampaignModal(discord.ui.Modal, title="Criar campanha / sorteio"):
                 ephemeral=True,
             )
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # Responder ao envio do modal imediatamente. Assim o Discord fecha o
+        # formulário e o administrador vê que o processamento começou.
+        await interaction.response.send_message(
+            "⏳ Recebi os dados. Estou consultando o item no Roblox e preparando a campanha...",
+            ephemeral=True,
+        )
         channel = self.channel
         if not isinstance(channel, discord.TextChannel) or channel.guild.id != self.guild_id:
-            await interaction.followup.send("O canal selecionado não é mais válido. Abra o painel e selecione novamente.", ephemeral=True)
+            await interaction.edit_original_response(
+                content="O canal selecionado não é mais válido. Abra o painel e selecione novamente."
+            )
             return
         try:
-            data = await self.bot.roblox.get_product(item_id)
+            log.info("Iniciando criação de campanha: guild=%s item_id=%s channel_id=%s",
+                     self.guild_id, item_id, channel.id)
+            # A consulta ao Roblox faz até três chamadas HTTP sequenciais.
+            # Limitar o tempo total evita deixar o formulário aparentemente preso.
+            data = await asyncio.wait_for(self.bot.roblox.get_product(item_id), timeout=50)
+            log.info("Dados do item Roblox recebidos: item_id=%s name=%s",
+                     item_id, data.get("name"))
             if not data.get("asset_type_id"):
                 raise ValueError("O Roblox não informou o tipo do item; não é possível validar favoritos.")
             async with self.bot.db.sessions() as session:
@@ -242,13 +256,19 @@ class CreateCampaignModal(discord.ui.Modal, title="Criar campanha / sorteio"):
             if old_id:
                 await refresh_campaign_message(self.bot, old_id)
             self.bot.add_view(CampaignPublicView(self.bot, campaign_id, item_id), message_id=message.id)
-            await interaction.followup.send(
-                f"✅ Campanha publicada em {channel.mention}.\nItem: **{data['name']}** (`{item_id}`)\nMeta: **{target}** • Ganhadores: **{winners}**",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content=f"✅ Campanha publicada em {channel.mention}.\nItem: **{data['name']}** (`{item_id}`)\nMeta: **{target}** • Ganhadores: **{winners}**"
+            )
+        except asyncio.TimeoutError:
+            log.exception("Tempo limite ao consultar Roblox durante criação da campanha: item_id=%s", item_id)
+            await interaction.edit_original_response(
+                content="⏱️ O Roblox demorou mais de 50 segundos para responder. Nenhuma campanha foi publicada. Tente novamente em alguns instantes."
             )
         except Exception as exc:
             log.exception("Falha ao criar campanha pelo painel administrativo")
-            await interaction.followup.send(f"Não foi possível criar a campanha: {str(exc)[:700]}", ephemeral=True)
+            await interaction.edit_original_response(
+                content=f"❌ Não foi possível criar a campanha: {str(exc)[:700]}"
+            )
 
 
 class EditCampaignModal(discord.ui.Modal, title="Editar campanha ativa"):
