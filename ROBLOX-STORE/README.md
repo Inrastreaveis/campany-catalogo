@@ -167,3 +167,36 @@ No `/configcatalogo`, abra **Personalização** e use **Definir banner** para co
 Em `/configcatalogo` > **Personalização** > **Enviar imagem**, selecione uma imagem diretamente do celular ou computador no formulário de upload do Discord. São aceitos JPG, PNG, WEBP e GIF, com limite de 8 MB. A imagem é armazenada no banco de dados e anexada novamente ao painel público nas atualizações, sem alterar as imagens individuais dos produtos. Use **Remover banner** para retirar a imagem.
 
 A interface de upload nativa em modal exige `discord.py` 2.7 ou superior; o `requirements.txt` foi atualizado para instalar essa versão.
+
+
+## Campanhas de favoritos e sorteios
+
+O módulo `src/commands/campaigns.py` adiciona um sistema de campanhas ao catálogo existente.
+
+### Comandos de administrador
+
+- `/campanha_criar`: cria uma campanha a partir do ID de um item Roblox, busca automaticamente nome, imagem e tipo do item, define meta, prêmio, quantidade de ganhadores, prazo de resposta e canal do painel.
+- `/campanha_editar`: altera o item, meta, prêmio, quantidade de ganhadores e prazo da campanha ativa.
+- `/campanha_participantes`: lista os participantes que tiveram o favorito confirmado.
+- `/campanha_sortear`: realiza o sorteio quando a contagem de favoritos atinge a meta.
+- `/campanha_substituir`: sorteia outra pessoa para uma posição cujo ganhador deixou o prazo expirar.
+- `/campanha_encerrar`: encerra inscrições da campanha ativa.
+
+### Fluxo público
+
+1. O botão **Favoritar no Roblox** abre o item correto.
+2. Depois de favoritar, o usuário clica em **Já favoritei — participar** e informa o username Roblox.
+3. O bot resolve o username para um Roblox User ID e consulta a lista pública de favoritos do tipo de ativo correspondente.
+4. Somente após confirmação positiva, grava a inscrição. Discord e Roblox IDs são únicos por campanha.
+5. O painel exibe a quantidade atual de favoritos acima da meta, sem barra de progresso, e atualiza a mensagem existente a cada 5 minutos.
+6. O botão **Ver participantes** exibe a lista de inscritos.
+7. O botão **Fazer sorteio** só funciona para administradores e só libera o sorteio depois de atingir a meta.
+8. Cada ganhador recebe uma DM com botão para confirmar o prêmio. O prazo é configurável; após expirar, o administrador pode usar `/campanha_substituir`.
+
+### Banco de dados
+
+As tabelas `campaigns`, `campaign_participants` e `campaign_winners` são criadas automaticamente por `Base.metadata.create_all`; o banco SQLite existente é preservado. Nenhuma variável nova de ambiente é obrigatória.
+
+### Limitação importante do Roblox
+
+A consulta individual de favoritos utiliza endpoints públicos documentados pelo Roblox, mas a própria documentação os classifica como experimentais. A confirmação depende de o perfil e a lista de favoritos estarem acessíveis publicamente; se a API não permitir confirmar, o bot não registra a participação. A contagem global pode sofrer atraso ou limitação temporária do serviço Roblox.
