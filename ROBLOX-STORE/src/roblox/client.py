@@ -39,6 +39,9 @@ class RobloxClient:
             await self.session.close()
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        # Some Roblox experimental endpoints return a scalar or list instead
+        # of an object. Only callers that explicitly opt in may receive it.
+        allow_non_object_json = bool(kwargs.pop("_allow_non_object_json", False))
         await self.start()
         assert self.session is not None
         async with self._semaphore:
@@ -52,7 +55,7 @@ class RobloxClient:
                             body = await retry.text()
                             if retry.status >= 400:
                                 raise RobloxAPIError(f"Roblox respondeu HTTP {retry.status}: {body[:200]}")
-                            return self._decode_json(body)
+                            return self._decode_json(body, allow_non_object=allow_non_object_json)
                     body = await response.text()
                     if response.status == 404:
                         raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
@@ -60,19 +63,19 @@ class RobloxClient:
                         raise RobloxAPIError("O Roblox limitou temporariamente as consultas. Tente novamente.")
                     if response.status >= 400:
                         raise RobloxAPIError(f"Roblox respondeu HTTP {response.status}: {body[:200]}")
-                    return self._decode_json(body)
+                    return self._decode_json(body, allow_non_object=allow_non_object_json)
             except asyncio.TimeoutError as exc:
                 raise RobloxAPIError("A API do Roblox demorou demais para responder.") from exc
             except aiohttp.ClientError as exc:
                 raise RobloxAPIError(f"Falha de comunicação com o Roblox: {exc}") from exc
 
     @staticmethod
-    def _decode_json(body: str) -> dict[str, Any]:
+    def _decode_json(body: str, allow_non_object: bool = False) -> Any:
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError as exc:
             raise RobloxAPIError("O Roblox retornou uma resposta inválida.") from exc
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) and not allow_non_object:
             raise RobloxAPIError("Formato inesperado de resposta do Roblox.")
         return data
 
@@ -93,9 +96,46 @@ class RobloxClient:
 
     async def get_favorite_count(self, asset_id: int, fallback: int | None = None) -> int | None:
         try:
-            data = await self._request("GET", f"{CATALOG}/v1/favorites/assets/{asset_id}/count")
-            count = data.get("count", data.get("favoriteCount"))
-            return int(count) if count is not None else fallback
+            data = await self._request(
+                "GET",
+                f"{CATALOG}/v1/favorites/assets/{asset_id}/count",
+                _allow_non_object_json=True,
+            )
+
+            # Roblox documents this experimental endpoint as a count model,
+            # but responses may be scalar or wrapped depending on the edge.
+            candidates = [data]
+            if isinstance(data, dict):
+                candidates.extend([
+                    data.get("count"),
+                    data.get("favoriteCount"),
+                    data.get("data"),
+                    data.get("Count"),
+                ])
+            elif isinstance(data, list):
+                candidates.extend(data[:3])
+
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    candidate = candidate.get(
+                        "count",
+                        candidate.get("favoriteCount", candidate.get("Count")),
+                    )
+                if candidate is None or isinstance(candidate, bool):
+                    continue
+                try:
+                    count = int(candidate)
+                    if count >= 0:
+                        return count
+                except (TypeError, ValueError):
+                    continue
+
+            log.warning(
+                "Resposta de favoritos sem contador reconhecível para o item %s: %r",
+                asset_id,
+                data,
+            )
+            return fallback
         except RobloxAPIError as exc:
             log.warning("Não foi possível atualizar favoritos do item %s: %s", asset_id, exc)
             return fallback
