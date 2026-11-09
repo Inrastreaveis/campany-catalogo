@@ -40,17 +40,6 @@ class CampaignAdminView(discord.ui.View):
             action=f"painel:{self.__class__.__name__}"
         )
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-        log.exception("Erro em interação do painel de campanhas", exc_info=error)
-        message = "Ocorreu um erro ao executar esta ação. Consulte os logs do bot."
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-        except discord.HTTPException:
-            log.exception("Não foi possível informar o erro ao administrador")
-
     @discord.ui.button(label="Criar campanha", emoji="🎁", style=discord.ButtonStyle.success, row=0)
     async def create_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
@@ -148,7 +137,7 @@ class CampaignChannelSelectView(discord.ui.View):
 
 class CampaignChannelSelect(discord.ui.ChannelSelect):
     def __init__(self, parent):
-        self.parent = parent
+        self.admin_panel = parent
         super().__init__(
             placeholder="Selecione o canal de publicação...",
             min_values=1,
@@ -158,19 +147,18 @@ class CampaignChannelSelect(discord.ui.ChannelSelect):
 
     async def callback(self, interaction: discord.Interaction):
         if not await require_admin_context(
-            interaction, guild_id=self.parent.guild_id, owner_id=self.parent.owner_id,
+            interaction, guild_id=self.admin_panel.guild_id, owner_id=self.admin_panel.owner_id,
             action="selecionar canal da campanha"
         ):
             return
         selected = self.values[0]
         selected_id = getattr(selected, "id", None)
         guild = interaction.guild
-        if guild is None or guild.id != self.parent.guild_id or selected_id is None:
+        if guild is None or guild.id != self.admin_panel.guild_id or selected_id is None:
             await interaction.response.send_message("Não consegui identificar o canal deste servidor.", ephemeral=True)
             return
-        # ChannelSelect resolves the selected guild channel for us. Avoid a
-        # network fetch before opening the modal, because a modal must be the
-        # interaction's first response and Discord enforces a 3-second deadline.
+        # ChannelSelect normally supplies a resolved channel object. Reuse it
+        # instead of making an extra HTTP request before opening the modal.
         channel = selected if isinstance(selected, discord.TextChannel) else guild.get_channel(int(selected_id))
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("Selecione um canal de texto deste servidor.", ephemeral=True)
@@ -187,7 +175,7 @@ class CampaignChannelSelect(discord.ui.ChannelSelect):
             )
             return
         await interaction.response.send_modal(
-            CreateCampaignModal(self.parent.bot, self.parent.owner_id, self.parent.guild_id, channel)
+            CreateCampaignModal(self.admin_panel.bot, self.admin_panel.owner_id, self.admin_panel.guild_id, channel)
         )
 
 
