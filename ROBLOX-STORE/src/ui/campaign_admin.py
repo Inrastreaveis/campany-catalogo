@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 
 async def active_campaign(session, guild_id: int):
+    """Compatibility helper: returns the newest active campaign."""
     result = await session.execute(
         select(Campaign).where(
             Campaign.guild_id == guild_id,
@@ -28,7 +29,19 @@ async def active_campaign(session, guild_id: int):
     return result.scalars().first()
 
 
+async def active_campaigns(session, guild_id: int):
+    result = await session.execute(
+        select(Campaign).where(
+            Campaign.guild_id == guild_id,
+            Campaign.is_active.is_(True),
+        ).order_by(Campaign.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
 class CampaignAdminView(discord.ui.View):
+    """Main campaign menu: create a campaign or choose one to manage."""
+
     def __init__(self, bot, owner_id: int, guild_id: int):
         super().__init__(timeout=900)
         self.bot = bot
@@ -44,35 +57,160 @@ class CampaignAdminView(discord.ui.View):
     @discord.ui.button(label="Criar campanha", emoji="🎁", style=discord.ButtonStyle.success, row=0)
     async def create_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "Primeiro, escolha o canal onde o painel da campanha será publicado.",
+            "Primeiro, escolha o canal onde o novo painel será publicado.",
             view=CampaignChannelSelectView(self.bot, self.owner_id, self.guild_id),
             ephemeral=True,
+        )
+
+    @discord.ui.button(label="Gerenciar campanhas", emoji="🗂️", style=discord.ButtonStyle.primary, row=0)
+    async def manage_campaigns(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with self.bot.db.sessions() as session:
+            campaigns = await active_campaigns(session, self.guild_id)
+        if not campaigns:
+            await interaction.response.send_message(
+                "Não há campanhas ativas. Use **Criar campanha** para publicar o primeiro painel.",
+                ephemeral=True,
+            )
+            return
+        view = CampaignSelectView(self.bot, self.owner_id, self.guild_id, campaigns)
+        await interaction.response.send_message(
+            f"Selecione qual campanha deseja administrar. **{len(campaigns)} campanha(s) ativa(s).**",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Voltar ao catálogo", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from src.commands.catalog_config import DashboardView, dashboard_embed
+        await interaction.response.edit_message(
+            content=None,
+            embed=await dashboard_embed(self.bot, self.guild_id),
+            view=DashboardView(self.bot, self.owner_id, self.guild_id),
+        )
+
+
+class CampaignSelectView(discord.ui.View):
+    """Paginated selector so every active campaign can be managed independently."""
+
+    def __init__(self, bot, owner_id: int, guild_id: int, campaigns: list[Campaign], page: int = 0):
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.campaigns = campaigns
+        self.page = max(0, min(page, max(0, (len(campaigns) - 1) // 25)))
+
+        start = self.page * 25
+        page_campaigns = campaigns[start:start + 25]
+        options = [
+            discord.SelectOption(
+                label=(campaign.item_name or f"Campanha {campaign.id}")[:100],
+                description=(
+                    f"ID {campaign.id} • {campaign.favorite_count:,}/{campaign.target_favorites:,} favoritos"
+                ).replace(",", ".")[:100],
+                value=str(campaign.id),
+                emoji="🎁",
+            )
+            for campaign in page_campaigns
+        ]
+        self.select_menu = discord.ui.Select(
+            placeholder="Escolha a campanha que deseja administrar...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+        self.select_menu.callback = self.select_campaign
+        self.add_item(self.select_menu)
+        self.previous_page.disabled = self.page == 0
+        self.next_page.disabled = (self.page + 1) * 25 >= len(campaigns)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_admin_context(
+            interaction, guild_id=self.guild_id, owner_id=self.owner_id,
+            action="selecionar campanha para administrar"
+        )
+
+    async def select_campaign(self, interaction: discord.Interaction):
+        campaign_id = int(self.select_menu.values[0])
+        async with self.bot.db.sessions() as session:
+            campaign = await session.get(Campaign, campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.response.send_message(
+                    "Essa campanha não está mais ativa. Atualize a lista e tente novamente.",
+                    ephemeral=True,
+                )
+                return
+            count = await participant_count(session, campaign_id)
+            embed = campaign_embed(campaign, count)
+            item_name = campaign.item_name
+        await interaction.response.edit_message(
+            content=f"Administrando **{item_name}** (campanha #{campaign_id}). Escolha uma ação:",
+            embed=embed,
+            view=CampaignManageView(self.bot, self.owner_id, self.guild_id, campaign_id),
+        )
+
+    @discord.ui.button(label="Anterior", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = CampaignSelectView(self.bot, self.owner_id, self.guild_id, self.campaigns, self.page - 1)
+        await interaction.response.edit_message(view=view)
+
+    @discord.ui.button(label="Próxima", emoji="➡️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = CampaignSelectView(self.bot, self.owner_id, self.guild_id, self.campaigns, self.page + 1)
+        await interaction.response.edit_message(view=view)
+
+    @discord.ui.button(label="Voltar", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Gerencie as campanhas e os sorteios diretamente por este painel.",
+            embed=None,
+            view=CampaignAdminView(self.bot, self.owner_id, self.guild_id),
+        )
+
+
+class CampaignManageView(discord.ui.View):
+    """Actions are always scoped to one explicitly selected campaign ID."""
+
+    def __init__(self, bot, owner_id: int, guild_id: int, campaign_id: int):
+        super().__init__(timeout=900)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.campaign_id = campaign_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_admin_context(
+            interaction, guild_id=self.guild_id, owner_id=self.owner_id,
+            action=f"administrar campanha:{self.campaign_id}"
         )
 
     @discord.ui.button(label="Editar campanha", emoji="⚙️", style=discord.ButtonStyle.primary, row=0)
     async def edit_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, self.guild_id)
-        if campaign is None:
-            await interaction.response.send_message("Não existe campanha ativa para editar.", ephemeral=True)
-            return
-        await interaction.response.send_modal(EditCampaignModal(self.bot, self.owner_id, self.guild_id, campaign))
+            campaign = await session.get(Campaign, self.campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.response.send_message("Esta campanha não está mais ativa.", ephemeral=True)
+                return
+        await interaction.response.send_modal(
+            EditCampaignModal(self.bot, self.owner_id, self.guild_id, campaign)
+        )
 
     @discord.ui.button(label="Participantes", emoji="👥", style=discord.ButtonStyle.secondary, row=0)
     async def participants(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, self.guild_id)
-            if campaign is None:
-                await interaction.response.send_message("Não existe campanha ativa.", ephemeral=True)
+            campaign = await session.get(Campaign, self.campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id:
+                await interaction.response.send_message("Campanha não encontrada.", ephemeral=True)
                 return
             result = await session.execute(
                 select(CampaignParticipant).where(
-                    CampaignParticipant.campaign_id == campaign.id
+                    CampaignParticipant.campaign_id == self.campaign_id
                 ).order_by(CampaignParticipant.joined_at)
             )
             rows = list(result.scalars().all())
         if not rows:
-            await interaction.response.send_message("Ainda não há participantes confirmados.", ephemeral=True)
+            await interaction.response.send_message("Ainda não há participantes confirmados nesta campanha.", ephemeral=True)
             return
         lines = [
             f"`{i}.` **{p.roblox_username}** — <@{p.discord_user_id}> (`{p.roblox_user_id}`)"
@@ -81,7 +219,7 @@ class CampaignAdminView(discord.ui.View):
         if len(rows) > 60:
             lines.append(f"... e mais {len(rows) - 60} participantes.")
         embed = discord.Embed(
-            title=f"👥 Participantes confirmados: {len(rows)}",
+            title=f"👥 Participantes — campanha #{self.campaign_id}: {len(rows)}",
             description="\n".join(lines)[:4000],
             color=0x5865F2,
         )
@@ -89,43 +227,47 @@ class CampaignAdminView(discord.ui.View):
 
     @discord.ui.button(label="Fazer sorteio", emoji="🏆", style=discord.ButtonStyle.primary, row=1)
     async def draw(self, interaction: discord.Interaction, button: discord.ui.Button):
-        async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, self.guild_id)
-            campaign_id = campaign.id if campaign else None
-        if campaign_id is None:
-            await interaction.response.send_message("Não existe campanha ativa.", ephemeral=True)
-            return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await draw_campaign(self.bot, campaign_id)
+        result = await draw_campaign(self.bot, self.campaign_id)
         await interaction.followup.send(result, ephemeral=True)
 
     @discord.ui.button(label="Sortear substituto", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
     async def substitute(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SubstituteWinnerModal(self.bot, self.owner_id, self.guild_id))
+        await interaction.response.send_modal(
+            SubstituteWinnerModal(self.bot, self.owner_id, self.guild_id, self.campaign_id)
+        )
 
     @discord.ui.button(label="Encerrar campanha", emoji="⛔", style=discord.ButtonStyle.danger, row=1)
     async def close_campaign(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, self.guild_id)
-            if campaign is None:
-                await interaction.response.send_message("Não existe campanha ativa.", ephemeral=True)
+            campaign = await session.get(Campaign, self.campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.response.send_message("Esta campanha já está encerrada ou não existe.", ephemeral=True)
                 return
             campaign.is_active = False
-            campaign_id = campaign.id
             await session.commit()
-        await refresh_campaign_message(self.bot, campaign_id)
-        await interaction.response.send_message(
-            "Campanha encerrada. O painel público foi atualizado e as inscrições foram fechadas.",
-            ephemeral=True,
+        await refresh_campaign_message(self.bot, self.campaign_id)
+        await interaction.response.edit_message(
+            content=f"⛔ Campanha **#{self.campaign_id}** encerrada. As outras campanhas continuam ativas.",
+            embed=None,
+            view=None,
         )
 
-    @discord.ui.button(label="Voltar ao catálogo", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
-    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        from src.commands.catalog_config import DashboardView, dashboard_embed
+    @discord.ui.button(label="Escolher outra campanha", emoji="🗂️", style=discord.ButtonStyle.secondary, row=2)
+    async def choose_another(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with self.bot.db.sessions() as session:
+            campaigns = await active_campaigns(session, self.guild_id)
+        if not campaigns:
+            await interaction.response.edit_message(
+                content="Não há campanhas ativas no momento.",
+                embed=None,
+                view=CampaignAdminView(self.bot, self.owner_id, self.guild_id),
+            )
+            return
         await interaction.response.edit_message(
-            content=None,
-            embed=await dashboard_embed(self.bot, self.guild_id),
-            view=DashboardView(self.bot, self.owner_id, self.guild_id),
+            content=f"Selecione qual campanha deseja administrar. **{len(campaigns)} campanha(s) ativa(s).**",
+            embed=None,
+            view=CampaignSelectView(self.bot, self.owner_id, self.guild_id, campaigns),
         )
 
 
@@ -231,10 +373,8 @@ class CreateCampaignModal(discord.ui.Modal, title="Criar campanha / sorteio"):
             if not data.get("asset_type_id"):
                 raise ValueError("O Roblox não informou o tipo do item; não é possível validar favoritos.")
             async with self.bot.db.sessions() as session:
-                old = await active_campaign(session, self.guild_id)
-                old_id = old.id if old else None
-                if old:
-                    old.is_active = False
+                # Campaigns are independent: creating a new panel must not
+                # deactivate any existing campaign in this server.
                 campaign = Campaign(
                     guild_id=self.guild_id, asset_id=item_id, asset_type_id=data["asset_type_id"],
                     item_name=data["name"], item_description=data.get("description", ""),
@@ -253,8 +393,6 @@ class CreateCampaignModal(discord.ui.Modal, title="Criar campanha / sorteio"):
                 campaign.message_id = message.id
                 await session.commit()
                 campaign_id = campaign.id
-            if old_id:
-                await refresh_campaign_message(self.bot, old_id)
             self.bot.add_view(CampaignPublicView(self.bot, campaign_id, item_id), message_id=message.id)
             await interaction.edit_original_response(
                 content=f"✅ Campanha publicada em {channel.mention}.\nItem: **{data['name']}** (`{item_id}`)\nMeta: **{target}** • Ganhadores: **{winners}**"
@@ -281,6 +419,7 @@ class EditCampaignModal(discord.ui.Modal, title="Editar campanha ativa"):
     def __init__(self, bot, owner_id: int, guild_id: int, campaign: Campaign):
         super().__init__(timeout=300)
         self.bot, self.owner_id, self.guild_id = bot, owner_id, guild_id
+        self.campaign_id = campaign.id
         self.item_id.default = str(campaign.asset_id)
         self.target.default = str(campaign.target_favorites)
         self.prize.default = campaign.prize_text
@@ -318,9 +457,9 @@ class EditCampaignModal(discord.ui.Modal, title="Editar campanha ativa"):
             return
 
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, self.guild_id)
-            if campaign is None:
-                await interaction.followup.send("Não existe campanha ativa.", ephemeral=True)
+            campaign = await session.get(Campaign, self.campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.followup.send("Esta campanha não está mais ativa.", ephemeral=True)
                 return
             winner_count = await session.scalar(
                 select(func.count(CampaignWinner.id)).where(CampaignWinner.campaign_id == campaign.id)
@@ -360,9 +499,10 @@ class EditCampaignModal(discord.ui.Modal, title="Editar campanha ativa"):
 class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
     position = discord.ui.TextInput(label="Posição que precisa de substituto", placeholder="Ex.: 1", max_length=2)
 
-    def __init__(self, bot, owner_id: int, guild_id: int):
+    def __init__(self, bot, owner_id: int, guild_id: int, campaign_id: int):
         super().__init__(timeout=300)
         self.bot, self.owner_id, self.guild_id = bot, owner_id, guild_id
+        self.campaign_id = campaign_id
 
     async def on_submit(self, interaction: discord.Interaction):
         if not await require_admin_context(interaction, guild_id=self.guild_id, owner_id=self.owner_id, action="sortear substituto pelo configcatalogo"):
@@ -376,9 +516,9 @@ class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.bot.db.sessions() as session:
-            campaign = await active_campaign(session, self.guild_id)
-            if campaign is None:
-                await interaction.followup.send("Não existe campanha ativa.", ephemeral=True)
+            campaign = await session.get(Campaign, self.campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.followup.send("Esta campanha não está mais ativa.", ephemeral=True)
                 return
             result = await session.execute(
                 select(CampaignWinner).where(
