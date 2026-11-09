@@ -1153,41 +1153,79 @@ class PublishChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        channel = self.values[0]
-        if (
-            not hasattr(channel, "send")
-            or getattr(getattr(channel, "guild", None), "id", None) != self.parent_view.guild_id
-        ):
-            await interaction.response.send_message("Selecione um canal de texto deste servidor.", ephemeral=True)
+        # ChannelSelect pode entregar um objeto parcial de canal. Resolva-o pelo ID
+        # dentro do servidor da interação antes de validar ou chamar .send().
+        selected = self.values[0]
+        selected_channel_id = getattr(selected, "id", None)
+        guild = interaction.guild
+        if guild is None or guild.id != self.parent_view.guild_id or selected_channel_id is None:
+            await interaction.response.send_message(
+                "Não consegui identificar o canal selecionado neste servidor. Tente novamente.",
+                ephemeral=True,
+            )
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        embed, view = await create_panel_payload(self.parent_view.bot, self.parent_view.guild_id)
-        banner_file = await create_panel_banner_file(self.parent_view.bot, self.parent_view.guild_id)
-        async with self.parent_view.bot.db.sessions() as session:
-            settings = await get_settings(session, self.parent_view.guild_id)
-            old_channel_id = settings.panel_channel_id
-            old_message_id = settings.panel_message_id
-        message = None
-        if old_channel_id == channel.id and old_message_id:
+
+        channel = guild.get_channel(int(selected_channel_id))
+        if channel is None:
             try:
-                message = await channel.fetch_message(old_message_id)
-                if banner_file and any(item.filename == banner_file.filename for item in message.attachments):
-                    banner_file.close()
-                    attachments = message.attachments
-                else:
-                    attachments = [banner_file] if banner_file else []
-                await message.edit(
-                    embed=embed,
-                    view=view,
-                    attachments=attachments,
-                )
+                channel = await guild.fetch_channel(int(selected_channel_id))
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                message = None
-        if message is None:
-            try:
-                # If the edit attempt failed, create a fresh File because discord.py may have closed it.
+                channel = None
+
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "Selecione um canal de texto deste servidor (não uma categoria ou outro tipo de canal).",
+                ephemeral=True,
+            )
+            return
+
+        me = guild.me
+        permissions = channel.permissions_for(me) if me else None
+        if permissions is None or not permissions.view_channel or not permissions.send_messages:
+            await interaction.response.send_message(
+                "Não tenho permissão para visualizar e enviar mensagens nesse canal.",
+                ephemeral=True,
+            )
+            return
+        if not permissions.embed_links:
+            await interaction.response.send_message(
+                "Preciso da permissão **Inserir links** (Embed Links) nesse canal para publicar o painel.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            embed, view = await create_panel_payload(self.parent_view.bot, self.parent_view.guild_id)
+            banner_file = await create_panel_banner_file(self.parent_view.bot, self.parent_view.guild_id)
+            async with self.parent_view.bot.db.sessions() as session:
+                settings = await get_settings(session, self.parent_view.guild_id)
+                old_channel_id = settings.panel_channel_id
+                old_message_id = settings.panel_message_id
+
+            message = None
+            if old_channel_id == channel.id and old_message_id:
+                try:
+                    message = await channel.fetch_message(old_message_id)
+                    if banner_file and any(item.filename == banner_file.filename for item in message.attachments):
+                        banner_file.close()
+                        attachments = message.attachments
+                    else:
+                        attachments = [banner_file] if banner_file else []
+                    await message.edit(embed=embed, view=view, attachments=attachments)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    message = None
+
+            if message is None:
+                # Recria o arquivo porque a tentativa de edição pode tê-lo fechado.
                 banner_file = await create_panel_banner_file(self.parent_view.bot, self.parent_view.guild_id)
                 if banner_file:
+                    if not permissions.attach_files:
+                        await interaction.followup.send(
+                            "O canal não permite anexar o banner. Conceda a permissão **Anexar arquivos** ou remova o banner do painel.",
+                            ephemeral=True,
+                        )
+                        return
                     message = await channel.send(
                         embed=embed,
                         view=view,
@@ -1200,17 +1238,32 @@ class PublishChannelSelect(discord.ui.ChannelSelect):
                         view=view,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except discord.Forbidden:
-                await interaction.followup.send(
-                    "Não tenho permissão para enviar mensagens e embeds nesse canal.", ephemeral=True
-                )
-                return
-        async with self.parent_view.bot.db.sessions() as session:
-            settings = await get_settings(session, self.parent_view.guild_id)
-            settings.panel_channel_id = channel.id
-            settings.panel_message_id = message.id
-            await session.commit()
-        await interaction.followup.send(f"Painel da loja publicado/atualizado em {channel.mention}.", ephemeral=True)
+
+            async with self.parent_view.bot.db.sessions() as session:
+                settings = await get_settings(session, self.parent_view.guild_id)
+                settings.panel_channel_id = channel.id
+                settings.panel_message_id = message.id
+                await session.commit()
+
+            await interaction.followup.send(
+                f"Painel da loja publicado/atualizado em {channel.mention}.",
+                ephemeral=True,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "O Discord bloqueou a publicação. Confira as permissões de visualizar canal, enviar mensagens, inserir links e anexar arquivos.",
+                ephemeral=True,
+            )
+        except Exception:
+            log.exception(
+                "Falha ao publicar painel no canal %s do servidor %s",
+                channel.id,
+                self.parent_view.guild_id,
+            )
+            await interaction.followup.send(
+                "Ocorreu um erro ao publicar o painel. O erro foi registrado no log do bot.",
+                ephemeral=True,
+            )
 
 
 class PublishChannelView(AdminView):
