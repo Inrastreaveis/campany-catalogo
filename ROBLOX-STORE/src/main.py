@@ -12,6 +12,7 @@ from src.models import GuildSettings, Product
 from src.roblox.client import RobloxClient
 from src.services.store import sync_product_from_roblox
 from src.ui.views import create_panel_payload, create_panel_banner_file
+from src.services.campaigns import refresh_campaign_counts, restore_campaign_views
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class RobloxStoreBot(commands.Bot):
         # The previous /loja, /categoria and /item command groups are no longer loaded.
         for extension in (
             "src.commands.catalog_config",
+            "src.commands.campaigns",
         ):
             await self.load_extension(extension)
             log.info("Extensão carregada: %s", extension)
@@ -48,8 +50,10 @@ class RobloxStoreBot(commands.Bot):
             log.info("Comandos globais sincronizados. A propagação pode demorar.")
 
         await self.restore_panel_views()
+        await restore_campaign_views(self)
         self.refresh_loop.change_interval(minutes=self.settings.refresh_interval_minutes)
         self.refresh_loop.start()
+        self.campaign_refresh_loop.start()
 
     async def on_ready(self):
         log.info("Conectado como %s (%s)", self.user, self.user.id if self.user else "sem ID")
@@ -163,9 +167,19 @@ class RobloxStoreBot(commands.Bot):
     async def before_refresh_loop(self):
         await self.wait_until_ready()
 
+    @tasks.loop(minutes=5)
+    async def campaign_refresh_loop(self):
+        await refresh_campaign_counts(self)
+
+    @campaign_refresh_loop.before_loop
+    async def before_campaign_refresh_loop(self):
+        await self.wait_until_ready()
+
     async def close(self):
         if self.refresh_loop.is_running():
             self.refresh_loop.cancel()
+        if self.campaign_refresh_loop.is_running():
+            self.campaign_refresh_loop.cancel()
         await self.roblox.close()
         await self.db.close()
         await super().close()
