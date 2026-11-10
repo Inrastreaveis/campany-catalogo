@@ -107,7 +107,7 @@ class CampaignParticipant(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
     guild_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    discord_user_id: Mapped[int] = mapped_column(BigInteger)
+    discord_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     roblox_user_id: Mapped[int] = mapped_column(BigInteger)
     roblox_username: Mapped[str] = mapped_column(String(30))
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
