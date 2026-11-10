@@ -19,6 +19,12 @@ class RobloxNotFound(RobloxAPIError):
     pass
 
 
+class RobloxRateLimited(RobloxAPIError):
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class RobloxClient:
     """Cliente público de leitura para o catálogo, thumbnails e favoritos Roblox."""
 
@@ -60,7 +66,15 @@ class RobloxClient:
                     if response.status == 404:
                         raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
                     if response.status == 429:
-                        raise RobloxAPIError("O Roblox limitou temporariamente as consultas. Tente novamente.")
+                        retry_after = response.headers.get("Retry-After")
+                        try:
+                            retry_after_seconds = float(retry_after) if retry_after else None
+                        except (TypeError, ValueError):
+                            retry_after_seconds = None
+                        raise RobloxRateLimited(
+                            "O Roblox limitou temporariamente as consultas.",
+                            retry_after=retry_after_seconds,
+                        )
                     if response.status >= 400:
                         raise RobloxAPIError(f"Roblox respondeu HTTP {response.status}: {body[:200]}")
                     return self._decode_json(body, allow_non_object=allow_non_object_json)
@@ -148,31 +162,63 @@ class RobloxClient:
         return None
 
     async def get_favorite_count(self, asset_id: int, fallback: int | None = None) -> int | None:
-        try:
-            data = await self._request(
-                "GET",
-                f"{CATALOG}/v1/favorites/assets/{asset_id}/count",
-                _allow_non_object_json=True,
-            )
-            count = self._extract_favorite_count(data)
-            if count is not None:
-                log.info("Favoritos do item Roblox %s atualizados: %s", asset_id, count)
-                return count
+        # Retry rate-limited count requests. This is useful when several
+        # active campaign panels are refreshed in the same cycle.
+        for attempt in range(3):
+            try:
+                data = await self._request(
+                    "GET",
+                    f"{CATALOG}/v1/favorites/assets/{asset_id}/count",
+                    _allow_non_object_json=True,
+                )
+                count = self._extract_favorite_count(data)
+                if count is not None:
+                    log.info(
+                        "Favoritos atualizados: asset_id=%s count=%s tentativa=%s",
+                        asset_id, count, attempt + 1,
+                    )
+                    return count
 
-            if isinstance(data, dict):
-                shape = f"object keys={list(data.keys())[:20]}"
-            else:
-                shape = f"type={type(data).__name__}"
-            log.warning(
-                "Resposta de favoritos sem contador reconhecível para o item %s (%s): %r",
-                asset_id,
-                shape,
-                data,
-            )
-            return fallback
-        except RobloxAPIError as exc:
-            log.warning("Não foi possível atualizar favoritos do item %s: %s", asset_id, exc)
-            return fallback
+                shape = (
+                    f"object keys={list(data.keys())[:20]}"
+                    if isinstance(data, dict)
+                    else f"type={type(data).__name__}"
+                )
+                log.warning(
+                    "Resposta de favoritos sem contador reconhecível: asset_id=%s (%s) body=%r",
+                    asset_id, shape, data,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
+                return fallback
+
+            except RobloxRateLimited as exc:
+                if attempt >= 2:
+                    log.warning(
+                        "Limite do Roblox persistiu após 3 tentativas: asset_id=%s; mantendo último valor=%s",
+                        asset_id, fallback,
+                    )
+                    return fallback
+
+                delay = exc.retry_after
+                if delay is None or delay <= 0:
+                    delay = 1.5 * (attempt + 1)
+                delay = min(max(delay, 0.75), 8.0)
+                log.warning(
+                    "Roblox HTTP 429 para asset_id=%s; nova tentativa %s/3 em %.1fs",
+                    asset_id, attempt + 2, delay,
+                )
+                await asyncio.sleep(delay)
+
+            except RobloxAPIError as exc:
+                log.warning(
+                    "Falha ao atualizar favoritos: asset_id=%s erro=%s; mantendo último valor=%s",
+                    asset_id, exc, fallback,
+                )
+                return fallback
+
+        return fallback
 
     async def get_thumbnail(self, asset_id: int) -> str | None:
         data = await self._request(
@@ -217,17 +263,65 @@ class RobloxClient:
         return rows[0]
 
     async def verify_public_favorite(
-        self, username: str, asset_id: int, asset_type_id: int | None, max_pages: int = 5
+        self,
+        username: str,
+        asset_id: int,
+        asset_type_id: int | None,
+        max_pages: int = 20,
     ) -> bool | None:
-        if not asset_type_id:
+        """
+        Confere se o ativo está na lista pública de favoritos do usuário.
+
+        True  = encontrado na lista.
+        False = lista consultada até o fim e item não encontrado.
+        None  = não foi possível concluir com segurança (API/limite/paginação).
+        """
+        if asset_type_id is None:
+            log.warning(
+                "Verificação de favorito impossível: asset_type_id ausente "
+                "(username=%s asset_id=%s)",
+                username,
+                asset_id,
+            )
             return None
-        user = await self.resolve_username(username)
-        user_id = int(user["id"])
-        cursor = None
-        for _ in range(max_pages):
-            params: dict[str, Any] = {"limit": 100, "sortOrder": "Desc"}
+
+        try:
+            asset_type_id = int(asset_type_id)
+            if asset_type_id <= 0:
+                raise ValueError("asset_type_id deve ser positivo")
+        except (TypeError, ValueError):
+            log.warning(
+                "asset_type_id inválido na verificação de favorito: "
+                "username=%s asset_id=%s asset_type_id=%r",
+                username,
+                asset_id,
+                asset_type_id,
+            )
+            return None
+
+        try:
+            user = await self.resolve_username(username)
+            user_id = int(user["id"])
+        except (RobloxAPIError, KeyError, TypeError, ValueError) as exc:
+            log.warning(
+                "Não foi possível resolver o usuário Roblox %s para verificar "
+                "o favorito do item %s: %s",
+                username,
+                asset_id,
+                exc,
+            )
+            return None
+
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        for page_number in range(1, max(1, int(max_pages)) + 1):
+            # The public favorites endpoint uses cursor pagination. Keep only
+            # documented/used pagination parameters; sortOrder is not needed.
+            params: dict[str, Any] = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
+
             try:
                 data = await self._request(
                     "GET",
@@ -235,15 +329,90 @@ class RobloxClient:
                     params=params,
                 )
             except RobloxAPIError as exc:
-                log.warning("Falha ao consultar favoritos públicos de %s: %s", username, exc)
+                log.warning(
+                    "Falha na API de favoritos: username=%s user_id=%s "
+                    "asset_id=%s asset_type_id=%s página=%s: %s",
+                    username,
+                    user_id,
+                    asset_id,
+                    asset_type_id,
+                    page_number,
+                    exc,
+                )
                 return None
-            for item in data.get("data") or []:
+
+            rows = data.get("data")
+            if not isinstance(rows, list):
+                log.warning(
+                    "Resposta inesperada ao listar favoritos: username=%s "
+                    "user_id=%s asset_type_id=%s página=%s chaves=%s",
+                    username,
+                    user_id,
+                    asset_type_id,
+                    page_number,
+                    list(data.keys())[:20] if isinstance(data, dict) else type(data).__name__,
+                )
+                return None
+
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                raw_item_id = item.get("id", item.get("assetId", item.get("asset_id")))
                 try:
-                    if int(item.get("id", 0)) == int(asset_id):
+                    if raw_item_id is not None and int(raw_item_id) == int(asset_id):
+                        log.info(
+                            "Favorito confirmado: username=%s user_id=%s "
+                            "asset_id=%s asset_type_id=%s página=%s",
+                            username,
+                            user_id,
+                            asset_id,
+                            asset_type_id,
+                            page_number,
+                        )
                         return True
                 except (TypeError, ValueError):
                     continue
-            cursor = data.get("nextPageCursor")
-            if not cursor:
+
+            next_cursor = data.get("nextPageCursor") or data.get("nextPageToken")
+            if not next_cursor:
+                log.info(
+                    "Favorito não encontrado após consultar todas as páginas: "
+                    "username=%s user_id=%s asset_id=%s asset_type_id=%s páginas=%s",
+                    username,
+                    user_id,
+                    asset_id,
+                    asset_type_id,
+                    page_number,
+                )
                 return False
+
+            next_cursor = str(next_cursor)
+            if next_cursor in seen_cursors or next_cursor == cursor:
+                log.warning(
+                    "Paginação repetida ao consultar favoritos: username=%s "
+                    "user_id=%s asset_id=%s asset_type_id=%s página=%s",
+                    username,
+                    user_id,
+                    asset_id,
+                    asset_type_id,
+                    page_number,
+                )
+                return None
+
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+            # Small spacing reduces bursts when a user has many favorites.
+            if page_number < max_pages:
+                await asyncio.sleep(0.15)
+
+        log.warning(
+            "Limite de páginas atingido sem conseguir confirmar o favorito: "
+            "username=%s user_id=%s asset_id=%s asset_type_id=%s max_pages=%s",
+            username,
+            user_id,
+            asset_id,
+            asset_type_id,
+            max_pages,
+        )
         return None
