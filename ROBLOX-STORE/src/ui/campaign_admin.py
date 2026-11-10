@@ -7,15 +7,58 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 
 from src.models import Campaign, CampaignParticipant, CampaignWinner
 from src.security import require_admin_context
+from src.roblox.client import RobloxAPIError, RobloxNotFound, RobloxRateLimited
 from src.services.campaigns import (
     CampaignPublicView, ClaimPrizeView, campaign_embed, draw_campaign, participant_count,
     refresh_campaign_message,
 )
 
 log = logging.getLogger(__name__)
+
+# Only members who hold this Discord role can use the manual Roblox tools.
+CAMPAIGN_MANAGER_ROLE_ID = 1567021603580149810
+
+
+async def require_campaign_manager_access(
+    interaction: discord.Interaction,
+    *,
+    guild_id: int,
+    owner_id: int,
+    action: str,
+) -> bool:
+    """Require the original admin panel owner plus the configured manager role."""
+    if not await require_admin_context(
+        interaction,
+        guild_id=guild_id,
+        owner_id=owner_id,
+        action=action,
+    ):
+        return False
+
+    roles = getattr(interaction.user, "roles", ())
+    if any(getattr(role, "id", None) == CAMPAIGN_MANAGER_ROLE_ID for role in roles):
+        return True
+
+    message = (
+        "Acesso negado. Esta função exige o cargo autorizado "
+        f"(ID: {CAMPAIGN_MANAGER_ROLE_ID})."
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    log.warning(
+        "Acesso manual de campanha bloqueado: action=%s guild_id=%s user_id=%s role_id=%s",
+        action,
+        guild_id,
+        getattr(interaction.user, "id", None),
+        CAMPAIGN_MANAGER_ROLE_ID,
+    )
+    return False
 
 
 async def active_campaign(session, guild_id: int):
@@ -79,13 +122,442 @@ class CampaignAdminView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Voltar ao catálogo", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Consultar nick Roblox", emoji="🔎", style=discord.ButtonStyle.secondary, row=1)
+    async def lookup_favorite(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_campaign_manager_access(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="consultar favoritos de um username Roblox",
+        ):
+            return
+        await interaction.response.send_modal(
+            FavoriteLookupModal(self.bot, self.owner_id, self.guild_id)
+        )
+
+    @discord.ui.button(label="Adicionar participante", emoji="➕", style=discord.ButtonStyle.success, row=1)
+    async def add_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_campaign_manager_access(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="adicionar participante manualmente",
+        ):
+            return
+        async with self.bot.db.sessions() as session:
+            campaigns = await active_campaigns(session, self.guild_id)
+        if not campaigns:
+            await interaction.response.send_message(
+                "Não há campanhas ativas para receber participantes.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "Selecione a campanha em que deseja inscrever a pessoa. Depois, escolha o membro do Discord e informe o username Roblox.",
+            view=ManualAddCampaignSelectView(
+                self.bot, self.owner_id, self.guild_id, campaigns
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Voltar ao catálogo", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         from src.commands.catalog_config import DashboardView, dashboard_embed
         await interaction.response.edit_message(
             content=None,
             embed=await dashboard_embed(self.bot, self.guild_id),
             view=DashboardView(self.bot, self.owner_id, self.guild_id),
+        )
+
+
+class FavoriteLookupModal(discord.ui.Modal, title="Consultar favoritos Roblox"):
+    username = discord.ui.TextInput(
+        label="Username Roblox da pessoa",
+        placeholder="Digite o username exato do Roblox",
+        min_length=3,
+        max_length=20,
+        required=True,
+    )
+
+    def __init__(self, bot, owner_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_campaign_manager_access(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="consultar favoritos Roblox",
+        ):
+            return
+
+        username_input = str(self.username.value).strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            user = await self.bot.roblox.resolve_username(username_input)
+        except RobloxRateLimited as exc:
+            wait = max(1, int((exc.retry_after or 30) + 0.999))
+            await interaction.followup.send(
+                f"O Roblox continua limitando as consultas. Tente novamente em aproximadamente {wait} segundos.",
+                ephemeral=True,
+            )
+            return
+        except RobloxNotFound:
+            await interaction.followup.send(
+                f"Não encontrei o username Roblox **{username_input}**.", ephemeral=True
+            )
+            return
+        except RobloxAPIError as exc:
+            await interaction.followup.send(
+                f"Não foi possível consultar essa conta Roblox: {exc}", ephemeral=True
+            )
+            return
+
+        canonical_username = str(user.get("name") or username_input)
+        async with self.bot.db.sessions() as session:
+            campaigns = await active_campaigns(session, self.guild_id)
+
+        if not campaigns:
+            await interaction.followup.send(
+                "Não há campanhas ativas neste servidor para consultar.", ephemeral=True
+            )
+            return
+
+        lines = [f"**Conta Roblox:** {canonical_username} (`{user.get('id')}`)"]
+        for index, campaign in enumerate(campaigns):
+            try:
+                verified = await self.bot.roblox.verify_public_favorite(
+                    canonical_username,
+                    int(campaign.asset_id),
+                    campaign.asset_type_id,
+                    max_pages=20,
+                    resolved_user=user,
+                )
+            except RobloxRateLimited as exc:
+                wait = max(1, int((exc.retry_after or 30) + 0.999))
+                lines.append(
+                    f"⚠️ **{campaign.item_name}:** consulta temporariamente limitada pelo Roblox "
+                    f"(aguarde cerca de {wait}s)."
+                )
+                # Do not fire more requests while Roblox is still limiting us.
+                for remaining in campaigns[index + 1:]:
+                    lines.append(f"⚪ **{remaining.item_name}:** não consultado por limite da API.")
+                break
+            except RobloxAPIError as exc:
+                log.warning("Falha na consulta administrativa de favoritos: %s", exc)
+                verified = None
+
+            if verified is True:
+                result_text = "✅ Favorito confirmado"
+            elif verified is False:
+                result_text = "❌ Não está nos favoritos públicos"
+            else:
+                result_text = "⚠️ Não foi possível confirmar"
+            lines.append(f"{result_text} — **{campaign.item_name}** (campanha #{campaign.id})")
+
+        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+
+class ManualAddCampaignSelectView(discord.ui.View):
+    def __init__(self, bot, owner_id: int, guild_id: int, campaigns: list[Campaign]):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        options = [
+            discord.SelectOption(
+                label=(campaign.item_name or f"Campanha {campaign.id}")[:100],
+                description=(
+                    f"Campanha #{campaign.id} • {campaign.favorite_count:,}/{campaign.target_favorites:,} favoritos"
+                ).replace(",", ".")[:100],
+                value=str(campaign.id),
+                emoji="🎁",
+            )
+            for campaign in campaigns[:25]
+        ]
+        self.campaign_select = discord.ui.Select(
+            placeholder="Escolha a campanha...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.campaign_select.callback = self.select_campaign
+        self.add_item(self.campaign_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_campaign_manager_access(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="selecionar campanha para inscrição manual",
+        )
+
+    async def select_campaign(self, interaction: discord.Interaction):
+        campaign_id = int(self.campaign_select.values[0])
+        async with self.bot.db.sessions() as session:
+            campaign = await session.get(Campaign, campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.response.send_message(
+                    "Essa campanha não está mais ativa. Abra o menu novamente.", ephemeral=True
+                )
+                return
+            item_name = campaign.item_name
+
+        await interaction.response.edit_message(
+            content=(
+                f"Campanha selecionada: **{item_name}**. Agora escolha o membro do Discord "
+                "que será vinculado ao username Roblox."
+            ),
+            view=ManualAddDiscordUserSelectView(
+                self.bot, self.owner_id, self.guild_id, campaign_id
+            ),
+        )
+
+
+class ManualAddDiscordUserSelectView(discord.ui.View):
+    def __init__(self, bot, owner_id: int, guild_id: int, campaign_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.campaign_id = campaign_id
+        self.user_select = discord.ui.UserSelect(
+            placeholder="Selecione o membro do Discord...",
+            min_values=1,
+            max_values=1,
+        )
+        self.user_select.callback = self.select_user
+        self.add_item(self.user_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_campaign_manager_access(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="selecionar membro para inscrição manual",
+        )
+
+    async def select_user(self, interaction: discord.Interaction):
+        selected = self.user_select.values[0]
+        selected_id = getattr(selected, "id", None)
+        if not selected_id or getattr(selected, "bot", False):
+            await interaction.response.send_message(
+                "Selecione uma pessoa válida do servidor, não um bot.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(
+            ManualAddParticipantModal(
+                self.bot,
+                self.owner_id,
+                self.guild_id,
+                self.campaign_id,
+                int(selected_id),
+            )
+        )
+
+
+class ManualAddParticipantModal(discord.ui.Modal, title="Adicionar participante"):
+    username = discord.ui.TextInput(
+        label="Username Roblox da pessoa",
+        placeholder="Digite o username exato do Roblox",
+        min_length=3,
+        max_length=20,
+        required=True,
+    )
+
+    def __init__(self, bot, owner_id: int, guild_id: int, campaign_id: int, discord_user_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.campaign_id = campaign_id
+        self.discord_user_id = discord_user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_campaign_manager_access(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="adicionar participante manualmente",
+        ):
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.followup.send("Use esta função dentro do servidor correto.", ephemeral=True)
+            return
+
+        member = guild.get_member(self.discord_user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(self.discord_user_id)
+            except discord.NotFound:
+                await interaction.followup.send(
+                    "O membro selecionado não está mais neste servidor.", ephemeral=True
+                )
+                return
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    "Não consegui confirmar o membro selecionado no Discord. Tente novamente.", ephemeral=True
+                )
+                return
+        if member.bot:
+            await interaction.followup.send("Bots não podem ser inscritos como participantes.", ephemeral=True)
+            return
+
+        username_input = str(self.username.value).strip()
+        try:
+            user = await self.bot.roblox.resolve_username(username_input)
+            roblox_id = int(user["id"])
+            canonical_username = str(user.get("name") or username_input).strip()
+        except RobloxRateLimited as exc:
+            wait = max(1, int((exc.retry_after or 30) + 0.999))
+            await interaction.followup.send(
+                f"O Roblox continua limitando as consultas. Tente novamente em aproximadamente {wait} segundos.",
+                ephemeral=True,
+            )
+            return
+        except RobloxNotFound:
+            await interaction.followup.send(
+                f"Não encontrei o username Roblox **{username_input}**.", ephemeral=True
+            )
+            return
+        except RobloxAPIError as exc:
+            await interaction.followup.send(
+                f"Não foi possível consultar essa conta Roblox: {exc}", ephemeral=True
+            )
+            return
+
+        async with self.bot.db.sessions() as session:
+            campaign = await session.get(Campaign, self.campaign_id)
+            if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                await interaction.followup.send("Esta campanha não está mais ativa.", ephemeral=True)
+                return
+            asset_id = int(campaign.asset_id)
+            asset_type_id = campaign.asset_type_id
+            item_name = campaign.item_name
+
+            existing_discord = await session.scalar(
+                select(CampaignParticipant).where(
+                    CampaignParticipant.campaign_id == self.campaign_id,
+                    CampaignParticipant.discord_user_id == self.discord_user_id,
+                )
+            )
+            if existing_discord:
+                await interaction.followup.send(
+                    f"{member.mention} já está inscrito nesta campanha.", ephemeral=True
+                )
+                return
+            existing_roblox = await session.scalar(
+                select(CampaignParticipant).where(
+                    CampaignParticipant.campaign_id == self.campaign_id,
+                    CampaignParticipant.roblox_user_id == roblox_id,
+                )
+            )
+            if existing_roblox:
+                await interaction.followup.send(
+                    f"A conta Roblox **{canonical_username}** já está inscrita nesta campanha.",
+                    ephemeral=True,
+                )
+                return
+
+        try:
+            verified = await self.bot.roblox.verify_public_favorite(
+                canonical_username,
+                asset_id,
+                asset_type_id,
+                max_pages=20,
+                resolved_user=user,
+            )
+        except RobloxRateLimited as exc:
+            wait = max(1, int((exc.retry_after or 30) + 0.999))
+            await interaction.followup.send(
+                f"O Roblox ainda está limitando a verificação. Nenhuma inscrição foi criada. "
+                f"Tente novamente em aproximadamente {wait} segundos.",
+                ephemeral=True,
+            )
+            return
+        except RobloxAPIError as exc:
+            log.warning("Falha ao verificar favorito em inscrição administrativa: %s", exc)
+            await interaction.followup.send(
+                "Não consegui confirmar o favorito no Roblox. Nenhuma inscrição foi criada.",
+                ephemeral=True,
+            )
+            return
+
+        if verified is not True:
+            if verified is False:
+                message = (
+                    f"A conta **{canonical_username}** não tem o item **{item_name}** "
+                    "nos favoritos públicos. A pessoa precisa favoritar o item antes da inscrição."
+                )
+            else:
+                message = (
+                    "Não foi possível confirmar o favorito com segurança. Nenhuma inscrição foi criada; "
+                    "tente novamente mais tarde."
+                )
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        try:
+            async with self.bot.db.sessions() as session:
+                campaign = await session.get(Campaign, self.campaign_id)
+                if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                    await interaction.followup.send("Esta campanha foi encerrada durante a verificação.", ephemeral=True)
+                    return
+                # Re-check uniqueness after the network verification to prevent
+                # simultaneous admin/public signups from creating duplicates.
+                duplicate = await session.scalar(
+                    select(CampaignParticipant).where(
+                        CampaignParticipant.campaign_id == self.campaign_id,
+                        (CampaignParticipant.discord_user_id == self.discord_user_id)
+                        | (CampaignParticipant.roblox_user_id == roblox_id),
+                    )
+                )
+                if duplicate:
+                    await interaction.followup.send(
+                        "Essa pessoa ou conta Roblox já está inscrita nesta campanha.", ephemeral=True
+                    )
+                    return
+                session.add(CampaignParticipant(
+                    campaign_id=self.campaign_id,
+                    guild_id=self.guild_id,
+                    discord_user_id=self.discord_user_id,
+                    roblox_user_id=roblox_id,
+                    roblox_username=canonical_username,
+                ))
+                await session.commit()
+        except IntegrityError:
+            await interaction.followup.send(
+                "Essa pessoa ou conta Roblox já está inscrita nesta campanha.", ephemeral=True
+            )
+            return
+        except Exception:
+            log.exception("Falha ao adicionar participante manualmente à campanha %s", self.campaign_id)
+            await interaction.followup.send("Não consegui salvar a inscrição. Consulte os logs do bot.", ephemeral=True)
+            return
+
+        await refresh_campaign_message(self.bot, self.campaign_id)
+        log.info(
+            "Participante adicionado por administrador: campaign_id=%s discord_user_id=%s "
+            "roblox_user_id=%s username=%s admin_id=%s",
+            self.campaign_id,
+            self.discord_user_id,
+            roblox_id,
+            canonical_username,
+            interaction.user.id,
+        )
+        await interaction.followup.send(
+            f"✅ **Participante inscrito com sucesso!**\n"
+            f"Membro Discord: {member.mention}\n"
+            f"Conta Roblox: **{canonical_username}**\n"
+            f"Campanha: **{item_name}**\n"
+            "O favorito foi verificado diretamente no Roblox.",
+            ephemeral=True,
         )
 
 
