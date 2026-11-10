@@ -123,44 +123,7 @@ class CampaignAdminView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Consultar nick Roblox", emoji="🔎", style=discord.ButtonStyle.secondary, row=1)
-    async def lookup_favorite(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_campaign_manager_access(
-            interaction,
-            guild_id=self.guild_id,
-            owner_id=self.owner_id,
-            action="consultar favoritos de um username Roblox",
-        ):
-            return
-        await interaction.response.send_modal(
-            FavoriteLookupModal(self.bot, self.owner_id, self.guild_id)
-        )
-
-    @discord.ui.button(label="Adicionar participante", emoji="➕", style=discord.ButtonStyle.success, row=1)
-    async def add_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_campaign_manager_access(
-            interaction,
-            guild_id=self.guild_id,
-            owner_id=self.owner_id,
-            action="adicionar participante manualmente",
-        ):
-            return
-        async with self.bot.db.sessions() as session:
-            campaigns = await active_campaigns(session, self.guild_id)
-        if not campaigns:
-            await interaction.response.send_message(
-                "Não há campanhas ativas para receber participantes.", ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            "Selecione a campanha e informe um ou mais usernames Roblox, um por linha. Cada nick será verificado antes da inscrição.",
-            view=ManualAddCampaignSelectView(
-                self.bot, self.owner_id, self.guild_id, campaigns
-            ),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Voltar ao catálogo", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Voltar ao catálogo", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         from src.commands.catalog_config import DashboardView, dashboard_embed
         await interaction.response.edit_message(
