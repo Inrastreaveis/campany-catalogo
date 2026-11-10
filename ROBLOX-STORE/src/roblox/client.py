@@ -31,7 +31,19 @@ class RobloxClient:
     def __init__(self, timeout_seconds: int = 15):
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self.session: aiohttp.ClientSession | None = None
-        self._semaphore = asyncio.Semaphore(4)
+
+        # All Roblox endpoints share one request queue. This prevents the
+        # catalog count loop and participant verification from hitting the
+        # public API in parallel and triggering HTTP 429 responses.
+        self._request_lock = asyncio.Lock()
+        self._min_request_interval = 2.5
+        self._last_request_at = 0.0
+        self._cooldown_until = 0.0
+        self._rate_limit_streak = 0
+
+        # Username lookups are stable for short periods; cache them to avoid
+        # resolving the same Roblox username more than once per signup/retry.
+        self._username_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def start(self) -> None:
         if self.session is None or self.session.closed:
@@ -44,40 +56,114 @@ class RobloxClient:
         if self.session and not self.session.closed:
             await self.session.close()
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+    def _activate_rate_limit(self, headers: Any) -> float:
+        """Set a shared cooldown after HTTP 429 and return its duration."""
+        raw_retry_after = headers.get("Retry-After") if headers else None
+        retry_after: float | None = None
+        if raw_retry_after:
+            try:
+                retry_after = float(raw_retry_after)
+            except (TypeError, ValueError):
+                retry_after = None
+
+        self._rate_limit_streak += 1
+        if retry_after is None or retry_after <= 0:
+            # No Retry-After header: use progressive cooldown, capped at 5 min.
+            retry_after = min(30.0 * (2 ** (self._rate_limit_streak - 1)), 300.0)
+
+        retry_after = max(1.0, retry_after)
+        loop = asyncio.get_running_loop()
+        self._cooldown_until = max(self._cooldown_until, loop.time() + retry_after)
+        log.warning(
+            "Roblox HTTP 429: fila global pausada por %.1fs (sequência=%s)",
+            retry_after,
+            self._rate_limit_streak,
+        )
+        return retry_after
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         # Some Roblox experimental endpoints return a scalar or list instead
         # of an object. Only callers that explicitly opt in may receive it.
         allow_non_object_json = bool(kwargs.pop("_allow_non_object_json", False))
         await self.start()
         assert self.session is not None
-        async with self._semaphore:
+
+        # Serialize ALL requests to Roblox, including username resolution,
+        # favorite counts, thumbnails and public favorite-list checks.
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            cooldown_remaining = self._cooldown_until - now
+            if cooldown_remaining > 0:
+                raise RobloxRateLimited(
+                    "O Roblox está temporariamente limitando as consultas.",
+                    retry_after=cooldown_remaining,
+                )
+
+            spacing = self._min_request_interval - (now - self._last_request_at)
+            if spacing > 0:
+                await asyncio.sleep(spacing)
+
+            now = loop.time()
+            cooldown_remaining = self._cooldown_until - now
+            if cooldown_remaining > 0:
+                raise RobloxRateLimited(
+                    "O Roblox está temporariamente limitando as consultas.",
+                    retry_after=cooldown_remaining,
+                )
+
+            self._last_request_at = now
             try:
                 async with self.session.request(method, url, **kwargs) as response:
+                    if response.status == 429:
+                        body = await response.text()
+                        delay = self._activate_rate_limit(response.headers)
+                        raise RobloxRateLimited(
+                            f"O Roblox limitou temporariamente as consultas: {body[:160]}",
+                            retry_after=delay,
+                        )
+
                     if response.status == 403 and response.headers.get("x-csrf-token"):
                         csrf = response.headers["x-csrf-token"]
-                        headers = dict(kwargs.pop("headers", {}) or {})
+                        headers = dict(kwargs.get("headers", {}) or {})
                         headers["x-csrf-token"] = csrf
-                        async with self.session.request(method, url, headers=headers, **kwargs) as retry:
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs["headers"] = headers
+
+                        # Keep the retry inside the same global queue and
+                        # preserve the minimum spacing between requests.
+                        await asyncio.sleep(self._min_request_interval)
+                        self._last_request_at = loop.time()
+                        async with self.session.request(method, url, **retry_kwargs) as retry:
                             body = await retry.text()
+                            if retry.status == 429:
+                                delay = self._activate_rate_limit(retry.headers)
+                                raise RobloxRateLimited(
+                                    "O Roblox limitou temporariamente as consultas.",
+                                    retry_after=delay,
+                                )
+                            if retry.status == 404:
+                                raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
                             if retry.status >= 400:
-                                raise RobloxAPIError(f"Roblox respondeu HTTP {retry.status}: {body[:200]}")
+                                raise RobloxAPIError(
+                                    f"Roblox respondeu HTTP {retry.status}: {body[:200]}"
+                                )
+                            self._rate_limit_streak = 0
                             return self._decode_json(body, allow_non_object=allow_non_object_json)
+
                     body = await response.text()
                     if response.status == 404:
                         raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
-                    if response.status == 429:
-                        retry_after = response.headers.get("Retry-After")
-                        try:
-                            retry_after_seconds = float(retry_after) if retry_after else None
-                        except (TypeError, ValueError):
-                            retry_after_seconds = None
-                        raise RobloxRateLimited(
-                            "O Roblox limitou temporariamente as consultas.",
-                            retry_after=retry_after_seconds,
-                        )
                     if response.status >= 400:
-                        raise RobloxAPIError(f"Roblox respondeu HTTP {response.status}: {body[:200]}")
+                        raise RobloxAPIError(
+                            f"Roblox respondeu HTTP {response.status}: {body[:200]}"
+                        )
+
+                    self._rate_limit_streak = 0
                     return self._decode_json(body, allow_non_object=allow_non_object_json)
+
+            except RobloxRateLimited:
+                raise
             except asyncio.TimeoutError as exc:
                 raise RobloxAPIError("A API do Roblox demorou demais para responder.") from exc
             except aiohttp.ClientError as exc:
@@ -162,63 +248,42 @@ class RobloxClient:
         return None
 
     async def get_favorite_count(self, asset_id: int, fallback: int | None = None) -> int | None:
-        # Retry rate-limited count requests. This is useful when several
-        # active campaign panels are refreshed in the same cycle.
-        for attempt in range(3):
-            try:
-                data = await self._request(
-                    "GET",
-                    f"{CATALOG}/v1/favorites/assets/{asset_id}/count",
-                    _allow_non_object_json=True,
-                )
-                count = self._extract_favorite_count(data)
-                if count is not None:
-                    log.info(
-                        "Favoritos atualizados: asset_id=%s count=%s tentativa=%s",
-                        asset_id, count, attempt + 1,
-                    )
-                    return count
+        try:
+            data = await self._request(
+                "GET",
+                f"{CATALOG}/v1/favorites/assets/{asset_id}/count",
+                _allow_non_object_json=True,
+            )
+            count = self._extract_favorite_count(data)
+            if count is not None:
+                log.info("Favoritos atualizados: asset_id=%s count=%s", asset_id, count)
+                return count
 
-                shape = (
-                    f"object keys={list(data.keys())[:20]}"
-                    if isinstance(data, dict)
-                    else f"type={type(data).__name__}"
-                )
-                log.warning(
-                    "Resposta de favoritos sem contador reconhecível: asset_id=%s (%s) body=%r",
-                    asset_id, shape, data,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(0.8 * (attempt + 1))
-                    continue
-                return fallback
+            shape = (
+                f"object keys={list(data.keys())[:20]}"
+                if isinstance(data, dict)
+                else f"type={type(data).__name__}"
+            )
+            log.warning(
+                "Resposta de favoritos sem contador reconhecível: asset_id=%s (%s); "
+                "mantendo último valor=%s",
+                asset_id, shape, fallback,
+            )
+            return fallback
 
-            except RobloxRateLimited as exc:
-                if attempt >= 2:
-                    log.warning(
-                        "Limite do Roblox persistiu após 3 tentativas: asset_id=%s; mantendo último valor=%s",
-                        asset_id, fallback,
-                    )
-                    return fallback
-
-                delay = exc.retry_after
-                if delay is None or delay <= 0:
-                    delay = 1.5 * (attempt + 1)
-                delay = min(max(delay, 0.75), 8.0)
-                log.warning(
-                    "Roblox HTTP 429 para asset_id=%s; nova tentativa %s/3 em %.1fs",
-                    asset_id, attempt + 2, delay,
-                )
-                await asyncio.sleep(delay)
-
-            except RobloxAPIError as exc:
-                log.warning(
-                    "Falha ao atualizar favoritos: asset_id=%s erro=%s; mantendo último valor=%s",
-                    asset_id, exc, fallback,
-                )
-                return fallback
-
-        return fallback
+        except RobloxRateLimited as exc:
+            log.warning(
+                "Contagem adiada por limite global do Roblox: asset_id=%s retry_after=%.1fs; "
+                "mantendo último valor=%s",
+                asset_id, exc.retry_after or 0.0, fallback,
+            )
+            return fallback
+        except RobloxAPIError as exc:
+            log.warning(
+                "Falha ao atualizar favoritos: asset_id=%s erro=%s; mantendo último valor=%s",
+                asset_id, exc, fallback,
+            )
+            return fallback
 
     async def get_thumbnail(self, asset_id: int) -> str | None:
         data = await self._request(
@@ -251,16 +316,38 @@ class RobloxClient:
         }
 
     async def resolve_username(self, username: str) -> dict[str, Any]:
+        clean_username = username.strip()
+        cache_key = clean_username.casefold()
+        now = asyncio.get_running_loop().time()
+        cached = self._username_cache.get(cache_key)
+        if cached and cached[0] > now:
+            log.debug("Username Roblox reutilizado do cache: %s", clean_username)
+            return dict(cached[1])
+        if cached:
+            self._username_cache.pop(cache_key, None)
+
         data = await self._request(
             "POST",
             f"{USERS}/v1/usernames/users",
-            json={"usernames": [username], "excludeBannedUsers": True},
+            json={"usernames": [clean_username], "excludeBannedUsers": True},
             headers={"Content-Type": "application/json"},
         )
         rows = data.get("data") or []
         if not rows:
             raise RobloxNotFound("Não encontrei esse username Roblox.")
-        return rows[0]
+
+        user = dict(rows[0])
+        self._username_cache[cache_key] = (now + 300.0, user)
+
+        # Keep the cache bounded during busy campaigns.
+        if len(self._username_cache) > 1000:
+            expired_keys = [
+                key for key, (expires_at, _) in self._username_cache.items()
+                if expires_at <= now
+            ]
+            for key in expired_keys:
+                self._username_cache.pop(key, None)
+        return user
 
     async def verify_public_favorite(
         self,
@@ -268,6 +355,7 @@ class RobloxClient:
         asset_id: int,
         asset_type_id: int | None,
         max_pages: int = 20,
+        resolved_user: dict[str, Any] | None = None,
     ) -> bool | None:
         """
         Confere se o ativo está na lista pública de favoritos do usuário.
@@ -300,8 +388,10 @@ class RobloxClient:
             return None
 
         try:
-            user = await self.resolve_username(username)
+            user = resolved_user or await self.resolve_username(username)
             user_id = int(user["id"])
+        except RobloxRateLimited:
+            raise
         except (RobloxAPIError, KeyError, TypeError, ValueError) as exc:
             log.warning(
                 "Não foi possível resolver o usuário Roblox %s para verificar "
@@ -328,6 +418,8 @@ class RobloxClient:
                     f"{CATALOG}/v1/favorites/users/{user_id}/favorites/{asset_type_id}/assets",
                     params=params,
                 )
+            except RobloxRateLimited:
+                raise
             except RobloxAPIError as exc:
                 log.warning(
                     "Falha na API de favoritos: username=%s user_id=%s "
