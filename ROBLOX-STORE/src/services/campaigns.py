@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -385,36 +386,112 @@ async def draw_campaign(bot, campaign_id: int) -> str:
 
 
 async def restore_campaign_views(bot):
+    """
+    Re-register persistent campaign components after every process restart.
+
+    Include closed campaigns too: their old public messages may still contain
+    buttons, and those buttons should answer "campaign closed" instead of
+    producing Discord's generic "interaction failed" response.
+    """
     async with bot.db.sessions() as session:
         campaigns_result = await session.execute(
-            select(Campaign).where(Campaign.is_active.is_(True), Campaign.message_id.is_not(None))
+            select(Campaign).where(Campaign.message_id.is_not(None)).order_by(Campaign.id)
         )
         campaigns = list(campaigns_result.scalars().all())
+
         winners_result = await session.execute(
             select(CampaignWinner, CampaignParticipant.discord_user_id)
             .join(CampaignParticipant, CampaignWinner.participant_id == CampaignParticipant.id)
             .where(CampaignWinner.status == "pending")
         )
         winners = list(winners_result.all())
+
+    restored_campaigns = 0
+    failed_campaigns = 0
     for campaign in campaigns:
-        bot.add_view(CampaignPublicView(bot, campaign.id, campaign.asset_id), message_id=campaign.message_id)
+        try:
+            view = CampaignPublicView(bot, campaign.id, campaign.asset_id)
+            bot.add_view(view, message_id=int(campaign.message_id))
+            restored_campaigns += 1
+            log.info(
+                "Painel persistente restaurado: campaign_id=%s message_id=%s "
+                "guild_id=%s active=%s",
+                campaign.id,
+                campaign.message_id,
+                campaign.guild_id,
+                campaign.is_active,
+            )
+        except Exception:
+            failed_campaigns += 1
+            log.exception(
+                "Falha ao restaurar interações do painel: campaign_id=%s message_id=%s",
+                campaign.id,
+                campaign.message_id,
+            )
+
+    restored_winners = 0
+    failed_winners = 0
     for winner, discord_user_id in winners:
-        bot.add_view(ClaimPrizeView(bot, winner.id, discord_user_id))
+        try:
+            view = ClaimPrizeView(bot, winner.id, discord_user_id)
+            bot.add_view(view)
+            restored_winners += 1
+        except Exception:
+            failed_winners += 1
+            log.exception(
+                "Falha ao restaurar botão de confirmação do vencedor: winner_id=%s",
+                winner.id,
+            )
+
+    log.info(
+        "Restauração de interações concluída: painéis=%s falhas_paineis=%s "
+        "confirmações_pendentes=%s falhas_confirmações=%s",
+        restored_campaigns,
+        failed_campaigns,
+        restored_winners,
+        failed_winners,
+    )
+    return {
+        "campaign_views": restored_campaigns,
+        "campaign_view_errors": failed_campaigns,
+        "winner_views": restored_winners,
+        "winner_view_errors": failed_winners,
+    }
 
 
 async def refresh_campaign_counts(bot):
     async with bot.db.sessions() as session:
         result = await session.execute(select(Campaign).where(Campaign.is_active.is_(True)))
         campaigns = list(result.scalars().all())
-    for campaign in campaigns:
+
+    log.info("Iniciando atualização de favoritos: campanhas_ativas=%s", len(campaigns))
+
+    for index, campaign in enumerate(campaigns):
+        asset_id = int(campaign.asset_id)
         try:
-            count = await bot.roblox.get_favorite_count(campaign.asset_id, campaign.favorite_count)
+            log.info(
+                "Consultando favoritos da campanha: campaign_id=%s asset_id=%s item=%s",
+                campaign.id, asset_id, campaign.item_name,
+            )
+            count = await bot.roblox.get_favorite_count(asset_id, campaign.favorite_count)
+
             if count is not None:
                 async with bot.db.sessions() as session:
                     current = await session.get(Campaign, campaign.id)
                     if current is not None and current.is_active:
+                        previous_count = current.favorite_count
                         current.favorite_count = count
                         await session.commit()
+                        log.info(
+                            "Contagem salva: campaign_id=%s asset_id=%s anterior=%s atual=%s",
+                            campaign.id, asset_id, previous_count, count,
+                        )
+            else:
+                log.warning(
+                    "Sem nova contagem para campaign_id=%s asset_id=%s; mantendo último valor salvo",
+                    campaign.id, asset_id,
+                )
+
             async with bot.db.sessions() as session:
                 winners_result = await session.execute(
                     select(CampaignWinner).where(
@@ -430,6 +507,19 @@ async def refresh_campaign_counts(bot):
                     if now > deadline:
                         winner.status = "expired"
                 await session.commit()
-            await refresh_campaign_message(bot, campaign.id)
+
+            updated = await refresh_campaign_message(bot, campaign.id)
+            log.info(
+                "Painel processado: campaign_id=%s asset_id=%s message_updated=%s",
+                campaign.id, asset_id, updated,
+            )
         except Exception:
-            log.exception("Falha ao atualizar campanha %s", campaign.id)
+            log.exception(
+                "Falha isolada ao atualizar campanha: campaign_id=%s asset_id=%s",
+                campaign.id, asset_id,
+            )
+
+        if index < len(campaigns) - 1:
+            await asyncio.sleep(0.8)
+
+    log.info("Atualização de favoritos concluída: campanhas_processadas=%s", len(campaigns))
