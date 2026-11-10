@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -152,7 +153,7 @@ class CampaignAdminView(discord.ui.View):
             )
             return
         await interaction.response.send_message(
-            "Selecione a campanha em que deseja inscrever a pessoa. Depois, escolha o membro do Discord e informe o username Roblox.",
+            "Selecione a campanha e informe um ou mais usernames Roblox, um por linha. Cada nick será verificado antes da inscrição.",
             view=ManualAddCampaignSelectView(
                 self.bot, self.owner_id, self.guild_id, campaigns
             ),
@@ -306,131 +307,84 @@ class ManualAddCampaignSelectView(discord.ui.View):
                 return
             item_name = campaign.item_name
 
-        await interaction.response.edit_message(
-            content=(
-                f"Campanha selecionada: **{item_name}**. Agora escolha o membro do Discord "
-                "que será vinculado ao username Roblox."
-            ),
-            view=ManualAddDiscordUserSelectView(
-                self.bot, self.owner_id, self.guild_id, campaign_id
-            ),
-        )
-
-
-class ManualAddDiscordUserSelectView(discord.ui.View):
-    def __init__(self, bot, owner_id: int, guild_id: int, campaign_id: int):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.owner_id = owner_id
-        self.guild_id = guild_id
-        self.campaign_id = campaign_id
-        self.user_select = discord.ui.UserSelect(
-            placeholder="Selecione o membro do Discord...",
-            min_values=1,
-            max_values=1,
-        )
-        self.user_select.callback = self.select_user
-        self.add_item(self.user_select)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await require_campaign_manager_access(
-            interaction,
-            guild_id=self.guild_id,
-            owner_id=self.owner_id,
-            action="selecionar membro para inscrição manual",
-        )
-
-    async def select_user(self, interaction: discord.Interaction):
-        selected = self.user_select.values[0]
-        selected_id = getattr(selected, "id", None)
-        if not selected_id or getattr(selected, "bot", False):
-            await interaction.response.send_message(
-                "Selecione uma pessoa válida do servidor, não um bot.", ephemeral=True
-            )
-            return
         await interaction.response.send_modal(
-            ManualAddParticipantModal(
+            ManualAddParticipantsModal(
                 self.bot,
                 self.owner_id,
                 self.guild_id,
-                self.campaign_id,
-                int(selected_id),
+                campaign_id,
+                item_name,
             )
         )
 
 
-class ManualAddParticipantModal(discord.ui.Modal, title="Adicionar participante"):
-    username = discord.ui.TextInput(
-        label="Username Roblox da pessoa",
-        placeholder="Digite o username exato do Roblox",
+class ManualAddParticipantsModal(discord.ui.Modal, title="Adicionar participantes Roblox"):
+    usernames = discord.ui.TextInput(
+        label="Nicks Roblox (um por linha)",
+        placeholder="Ex.: desvalorizei, Badfeelingsatnight",
+        style=discord.TextStyle.paragraph,
         min_length=3,
-        max_length=20,
+        max_length=4000,
         required=True,
     )
 
-    def __init__(self, bot, owner_id: int, guild_id: int, campaign_id: int, discord_user_id: int):
+    def __init__(
+        self,
+        bot,
+        owner_id: int,
+        guild_id: int,
+        campaign_id: int,
+        item_name: str,
+    ):
         super().__init__(timeout=300)
         self.bot = bot
         self.owner_id = owner_id
         self.guild_id = guild_id
         self.campaign_id = campaign_id
-        self.discord_user_id = discord_user_id
+        self.item_name = item_name
 
     async def on_submit(self, interaction: discord.Interaction):
         if not await require_campaign_manager_access(
             interaction,
             guild_id=self.guild_id,
             owner_id=self.owner_id,
-            action="adicionar participante manualmente",
+            action="adicionar participantes Roblox manualmente",
         ):
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        guild = interaction.guild
-        if guild is None or guild.id != self.guild_id:
-            await interaction.followup.send("Use esta função dentro do servidor correto.", ephemeral=True)
+        raw_names = re.split(r"[\n,;]+", str(self.usernames.value))
+        usernames = []
+        seen = set()
+        repeated_input = []
+        for raw in raw_names:
+            name = raw.strip().lstrip("@").strip()
+            if not name:
+                continue
+            key = name.casefold()
+            if key in seen:
+                repeated_input.append(name)
+                continue
+            seen.add(key)
+            usernames.append(name)
+
+        if not usernames:
+            await interaction.response.send_message(
+                "Informe pelo menos um username Roblox, um por linha.", ephemeral=True
+            )
             return
 
-        member = guild.get_member(self.discord_user_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(self.discord_user_id)
-            except discord.NotFound:
-                await interaction.followup.send(
-                    "O membro selecionado não está mais neste servidor.", ephemeral=True
-                )
-                return
-            except discord.HTTPException:
-                await interaction.followup.send(
-                    "Não consegui confirmar o membro selecionado no Discord. Tente novamente.", ephemeral=True
-                )
-                return
-        if member.bot:
-            await interaction.followup.send("Bots não podem ser inscritos como participantes.", ephemeral=True)
-            return
-
-        username_input = str(self.username.value).strip()
-        try:
-            user = await self.bot.roblox.resolve_username(username_input)
-            roblox_id = int(user["id"])
-            canonical_username = str(user.get("name") or username_input).strip()
-        except RobloxRateLimited as exc:
-            wait = max(1, int((exc.retry_after or 30) + 0.999))
-            await interaction.followup.send(
-                f"O Roblox continua limitando as consultas. Tente novamente em aproximadamente {wait} segundos.",
+        # There is no campaign-wide participant cap. Keep each modal batch
+        # bounded so the public Roblox API is not overwhelmed by a long burst.
+        batch_limit = 20
+        if len(usernames) > batch_limit:
+            await interaction.response.send_message(
+                f"Envie até {batch_limit} usernames por vez. Não existe limite total de participantes; "
+                "basta repetir o cadastro com o próximo grupo.",
                 ephemeral=True,
             )
             return
-        except RobloxNotFound:
-            await interaction.followup.send(
-                f"Não encontrei o username Roblox **{username_input}**.", ephemeral=True
-            )
-            return
-        except RobloxAPIError as exc:
-            await interaction.followup.send(
-                f"Não foi possível consultar essa conta Roblox: {exc}", ephemeral=True
-            )
-            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
         async with self.bot.db.sessions() as session:
             campaign = await session.get(Campaign, self.campaign_id)
@@ -441,124 +395,152 @@ class ManualAddParticipantModal(discord.ui.Modal, title="Adicionar participante"
             asset_type_id = campaign.asset_type_id
             item_name = campaign.item_name
 
-            existing_discord = await session.scalar(
-                select(CampaignParticipant).where(
-                    CampaignParticipant.campaign_id == self.campaign_id,
-                    CampaignParticipant.discord_user_id == self.discord_user_id,
-                )
-            )
-            if existing_discord:
-                await interaction.followup.send(
-                    f"{member.mention} já está inscrito nesta campanha.", ephemeral=True
-                )
-                return
-            existing_roblox = await session.scalar(
-                select(CampaignParticipant).where(
-                    CampaignParticipant.campaign_id == self.campaign_id,
-                    CampaignParticipant.roblox_user_id == roblox_id,
-                )
-            )
-            if existing_roblox:
-                await interaction.followup.send(
-                    f"A conta Roblox **{canonical_username}** já está inscrita nesta campanha.",
-                    ephemeral=True,
-                )
-                return
+        added: list[str] = []
+        duplicates: list[str] = []
+        not_found: list[str] = []
+        not_favorited: list[str] = []
+        unverifiable: list[str] = []
+        invalid: list[str] = []
+        stopped_waiting: list[str] = []
+        api_errors: list[str] = []
+        wait_seconds: int | None = None
+        campaign_stopped = False
 
-        try:
-            verified = await self.bot.roblox.verify_public_favorite(
-                canonical_username,
-                asset_id,
-                asset_type_id,
-                max_pages=20,
-                resolved_user=user,
-            )
-        except RobloxRateLimited as exc:
-            wait = max(1, int((exc.retry_after or 30) + 0.999))
-            await interaction.followup.send(
-                f"O Roblox ainda está limitando a verificação. Nenhuma inscrição foi criada. "
-                f"Tente novamente em aproximadamente {wait} segundos.",
-                ephemeral=True,
-            )
-            return
-        except RobloxAPIError as exc:
-            log.warning("Falha ao verificar favorito em inscrição administrativa: %s", exc)
-            await interaction.followup.send(
-                "Não consegui confirmar o favorito no Roblox. Nenhuma inscrição foi criada.",
-                ephemeral=True,
-            )
-            return
+        for index, username_input in enumerate(usernames):
+            if not 3 <= len(username_input) <= 20:
+                invalid.append(username_input)
+                continue
 
-        if verified is not True:
-            if verified is False:
-                message = (
-                    f"A conta **{canonical_username}** não tem o item **{item_name}** "
-                    "nos favoritos públicos. A pessoa precisa favoritar o item antes da inscrição."
-                )
-            else:
-                message = (
-                    "Não foi possível confirmar o favorito com segurança. Nenhuma inscrição foi criada; "
-                    "tente novamente mais tarde."
-                )
-            await interaction.followup.send(message, ephemeral=True)
-            return
+            try:
+                user = await self.bot.roblox.resolve_username(username_input)
+                roblox_id = int(user["id"])
+                canonical_username = str(user.get("name") or username_input).strip()
+            except RobloxRateLimited as exc:
+                wait_seconds = max(1, int((exc.retry_after or 30) + 0.999))
+                stopped_waiting = usernames[index:]
+                break
+            except RobloxNotFound:
+                not_found.append(username_input)
+                continue
+            except RobloxAPIError as exc:
+                log.warning("Falha ao resolver username Roblox %s: %s", username_input, exc)
+                api_errors.append(username_input)
+                continue
 
-        try:
             async with self.bot.db.sessions() as session:
                 campaign = await session.get(Campaign, self.campaign_id)
                 if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
-                    await interaction.followup.send("Esta campanha foi encerrada durante a verificação.", ephemeral=True)
-                    return
-                # Re-check uniqueness after the network verification to prevent
-                # simultaneous admin/public signups from creating duplicates.
+                    stopped_waiting = usernames[index:]
+                    campaign_stopped = True
+                    break
                 duplicate = await session.scalar(
                     select(CampaignParticipant).where(
                         CampaignParticipant.campaign_id == self.campaign_id,
-                        (CampaignParticipant.discord_user_id == self.discord_user_id)
-                        | (CampaignParticipant.roblox_user_id == roblox_id),
+                        CampaignParticipant.roblox_user_id == roblox_id,
                     )
                 )
-                if duplicate:
-                    await interaction.followup.send(
-                        "Essa pessoa ou conta Roblox já está inscrita nesta campanha.", ephemeral=True
-                    )
-                    return
-                session.add(CampaignParticipant(
-                    campaign_id=self.campaign_id,
-                    guild_id=self.guild_id,
-                    discord_user_id=self.discord_user_id,
-                    roblox_user_id=roblox_id,
-                    roblox_username=canonical_username,
-                ))
-                await session.commit()
-        except IntegrityError:
-            await interaction.followup.send(
-                "Essa pessoa ou conta Roblox já está inscrita nesta campanha.", ephemeral=True
-            )
-            return
-        except Exception:
-            log.exception("Falha ao adicionar participante manualmente à campanha %s", self.campaign_id)
-            await interaction.followup.send("Não consegui salvar a inscrição. Consulte os logs do bot.", ephemeral=True)
-            return
+            if duplicate:
+                duplicates.append(canonical_username)
+                continue
 
-        await refresh_campaign_message(self.bot, self.campaign_id)
-        log.info(
-            "Participante adicionado por administrador: campaign_id=%s discord_user_id=%s "
-            "roblox_user_id=%s username=%s admin_id=%s",
-            self.campaign_id,
-            self.discord_user_id,
-            roblox_id,
-            canonical_username,
-            interaction.user.id,
-        )
-        await interaction.followup.send(
-            f"✅ **Participante inscrito com sucesso!**\n"
-            f"Membro Discord: {member.mention}\n"
-            f"Conta Roblox: **{canonical_username}**\n"
-            f"Campanha: **{item_name}**\n"
-            "O favorito foi verificado diretamente no Roblox.",
-            ephemeral=True,
-        )
+            try:
+                verified = await self.bot.roblox.verify_public_favorite(
+                    canonical_username,
+                    asset_id,
+                    asset_type_id,
+                    max_pages=20,
+                    resolved_user=user,
+                )
+            except RobloxRateLimited as exc:
+                wait_seconds = max(1, int((exc.retry_after or 30) + 0.999))
+                stopped_waiting = usernames[index:]
+                break
+            except RobloxAPIError as exc:
+                log.warning(
+                    "Falha ao verificar favorito do username %s na campanha %s: %s",
+                    canonical_username,
+                    self.campaign_id,
+                    exc,
+                )
+                unverifiable.append(canonical_username)
+                continue
+
+            if verified is False:
+                not_favorited.append(canonical_username)
+                continue
+            if verified is not True:
+                unverifiable.append(canonical_username)
+                continue
+
+            try:
+                async with self.bot.db.sessions() as session:
+                    campaign = await session.get(Campaign, self.campaign_id)
+                    if campaign is None or campaign.guild_id != self.guild_id or not campaign.is_active:
+                        stopped_waiting = usernames[index:]
+                        campaign_stopped = True
+                        break
+                    duplicate = await session.scalar(
+                        select(CampaignParticipant).where(
+                            CampaignParticipant.campaign_id == self.campaign_id,
+                            CampaignParticipant.roblox_user_id == roblox_id,
+                        )
+                    )
+                    if duplicate:
+                        duplicates.append(canonical_username)
+                        continue
+                    # Manual entries are Roblox-only. No Discord ID is stored,
+                    # so the administrator is never shown as the participant.
+                    session.add(CampaignParticipant(
+                        campaign_id=self.campaign_id,
+                        guild_id=self.guild_id,
+                        discord_user_id=None,
+                        roblox_user_id=roblox_id,
+                        roblox_username=canonical_username,
+                    ))
+                    await session.commit()
+                added.append(canonical_username)
+            except IntegrityError:
+                duplicates.append(canonical_username)
+            except Exception:
+                log.exception(
+                    "Falha ao salvar inscrição manual: campaign_id=%s username=%s",
+                    self.campaign_id,
+                    canonical_username,
+                )
+                api_errors.append(canonical_username)
+
+        if added:
+            await refresh_campaign_message(self.bot, self.campaign_id)
+
+        summary = [
+            f"**Campanha:** {item_name}",
+            f"✅ **Adicionados:** {len(added)}",
+            f"♻️ **Já cadastrados/duplicados:** {len(duplicates) + len(repeated_input)}",
+            f"❤️ **Ainda não favoritaram:** {len(not_favorited)}",
+            f"❓ **Não foi possível verificar:** {len(unverifiable) + len(api_errors)}",
+            f"🚫 **Username inválido/não encontrado:** {len(invalid) + len(not_found)}",
+        ]
+        if added:
+            summary.append("**Inscritos:** " + ", ".join(f"`{name}`" for name in added))
+        if duplicates or repeated_input:
+            summary.append("**Duplicados:** " + ", ".join(f"`{name}`" for name in (duplicates + repeated_input)))
+        if not_favorited:
+            summary.append("**Sem favorito:** " + ", ".join(f"`{name}`" for name in not_favorited))
+        if not_found or invalid:
+            summary.append("**Não encontrados/inválidos:** " + ", ".join(f"`{name}`" for name in (not_found + invalid)))
+        if unverifiable or api_errors:
+            summary.append("**Verificação pendente:** " + ", ".join(f"`{name}`" for name in (unverifiable + api_errors)))
+        if campaign_stopped:
+            summary.append(
+                "⛔ A campanha foi encerrada durante o processamento. Os cadastros já confirmados foram mantidos."
+            )
+        elif stopped_waiting:
+            summary.append(
+                f"⏸️ O Roblox aplicou limite. Parei neste ponto; {len(stopped_waiting)} username(s) "
+                f"ficaram sem consulta. Aguarde aproximadamente {wait_seconds or 30} segundos e envie apenas os pendentes."
+            )
+
+        await interaction.followup.send("\n".join(summary)[:1900], ephemeral=True)
 
 
 class CampaignSelectView(discord.ui.View):
@@ -684,10 +666,12 @@ class CampaignManageView(discord.ui.View):
         if not rows:
             await interaction.response.send_message("Ainda não há participantes confirmados nesta campanha.", ephemeral=True)
             return
-        lines = [
-            f"`{i}.` **{p.roblox_username}** — <@{p.discord_user_id}> (`{p.roblox_user_id}`)"
-            for i, p in enumerate(rows[:60], start=1)
-        ]
+        lines = []
+        for i, participant in enumerate(rows[:60], start=1):
+            entry = f"`{i}.` **{participant.roblox_username}**"
+            if participant.discord_user_id is not None:
+                entry += f" — <@{participant.discord_user_id}>"
+            lines.append(entry)
         if len(rows) > 60:
             lines.append(f"... e mais {len(rows) - 60} participantes.")
         embed = discord.Embed(
@@ -977,7 +961,12 @@ class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
         self.campaign_id = campaign_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not await require_admin_context(interaction, guild_id=self.guild_id, owner_id=self.owner_id, action="sortear substituto pelo configcatalogo"):
+        if not await require_admin_context(
+            interaction,
+            guild_id=self.guild_id,
+            owner_id=self.owner_id,
+            action="sortear substituto pelo configcatalogo",
+        ):
             return
         try:
             position = int(str(self.position.value).strip())
@@ -986,6 +975,7 @@ class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
         except ValueError:
             await interaction.response.send_message("Informe uma posição entre 1 e 20.", ephemeral=True)
             return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.bot.db.sessions() as session:
             campaign = await session.get(Campaign, self.campaign_id)
@@ -1001,7 +991,9 @@ class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
             )
             previous = result.scalars().first()
             if previous is None:
-                await interaction.followup.send("Não encontrei ganhador pendente ou expirado nessa posição.", ephemeral=True)
+                await interaction.followup.send(
+                    "Não encontrei ganhador pendente ou expirado nessa posição.", ephemeral=True
+                )
                 return
             deadline = previous.response_deadline
             if deadline.tzinfo is None:
@@ -1009,6 +1001,7 @@ class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
             if previous.status == "pending" and datetime.now(timezone.utc) <= deadline:
                 await interaction.followup.send("O prazo do ganhador ainda não terminou.", ephemeral=True)
                 return
+
             previous.status = "replaced"
             excluded_result = await session.execute(
                 select(CampaignWinner.participant_id).where(CampaignWinner.campaign_id == campaign.id)
@@ -1023,26 +1016,58 @@ class SubstituteWinnerModal(discord.ui.Modal, title="Sortear substituto"):
                 await session.commit()
                 await interaction.followup.send("Não há participantes elegíveis restantes.", ephemeral=True)
                 return
+
             selected = secrets.SystemRandom().choice(eligible)
             now = datetime.now(timezone.utc)
             winner = CampaignWinner(
-                campaign_id=campaign.id, participant_id=selected.id, position=position,
-                attempt=previous.attempt + 1, status="pending", drawn_at=now,
+                campaign_id=campaign.id,
+                participant_id=selected.id,
+                position=position,
+                attempt=previous.attempt + 1,
+                status="pending",
+                drawn_at=now,
                 response_deadline=now + timedelta(minutes=campaign.response_timeout_minutes),
             )
             session.add(winner)
             await session.flush()
-            winner_id, user_id = winner.id, selected.discord_user_id
-            username, item_name, prize, timeout = selected.roblox_username, campaign.item_name, campaign.prize_text, campaign.response_timeout_minutes
+            winner_id = winner.id
+            user_id = selected.discord_user_id
+            username = selected.roblox_username
+            item_name = campaign.item_name
+            prize = campaign.prize_text
+            timeout = campaign.response_timeout_minutes
+            channel_id = campaign.channel_id
             await session.commit()
+
+        if user_id is not None:
+            try:
+                user = await self.bot.fetch_user(user_id)
+                view = ClaimPrizeView(self.bot, winner_id, user_id)
+                await user.send(
+                    f"🎉 Você foi selecionado(a) como substituto(a) do **{position}º lugar** "
+                    f"na campanha **{item_name}**!\n**Roblox:** {username}\n"
+                    f"**Prêmio:** {prize}\nVocê tem **{timeout} minutos** para responder.",
+                    view=view,
+                )
+                self.bot.add_view(view)
+            except (discord.Forbidden, discord.HTTPException):
+                log.warning("Não foi possível enviar DM ao vencedor substituto %s", user_id)
+
         try:
-            user = await self.bot.fetch_user(user_id)
-            await user.send(
-                f"🎉 Você foi selecionado(a) como substituto(a) do **{position}º lugar** na campanha **{item_name}**!\n"
-                f"**Prêmio:** {prize}\nVocê tem **{timeout} minutos** para responder.",
-                view=ClaimPrizeView(self.bot, winner_id, user_id),
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            await channel.send(
+                f"@here\n🔁 **NOVO GANHADOR — {discord.utils.escape_mentions(item_name)}**\n**{position}º lugar:** `{discord.utils.escape_mentions(username)}`",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=True, users=False, roles=False, replied_user=False
+                ),
             )
-        except (discord.Forbidden, discord.HTTPException):
-            log.warning("Não foi possível enviar DM ao vencedor substituto %s", user_id)
-        self.bot.add_view(ClaimPrizeView(self.bot, winner_id, user_id))
-        await interaction.followup.send(f"✅ Substituto sorteado: **{username}** para o {position}º lugar.", ephemeral=True)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            log.exception(
+                "Não foi possível anunciar o ganhador substituto da campanha %s",
+                self.campaign_id,
+            )
+
+        await interaction.followup.send(
+            f"✅ Substituto sorteado: **{username}** para o {position}º lugar.",
+            ephemeral=True,
+        )
