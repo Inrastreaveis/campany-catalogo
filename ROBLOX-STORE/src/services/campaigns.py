@@ -8,6 +8,7 @@ import discord
 from sqlalchemy import select, func
 
 from src.models import Campaign, CampaignParticipant, CampaignWinner
+from src.roblox.client import RobloxRateLimited, RobloxAPIError
 
 log = logging.getLogger(__name__)
 
@@ -84,26 +85,79 @@ class RobloxUsernameModal(discord.ui.Modal, title="Confirmar participação"):
         self.campaign_id = campaign_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Acknowledge the modal immediately; Roblox lookups may be queued.
         await interaction.response.defer(ephemeral=True, thinking=True)
+
         async with self.bot.db.sessions() as session:
             campaign = await session.get(Campaign, self.campaign_id)
             if campaign is None or not campaign.is_active:
-                await interaction.followup.send("Esta campanha não está mais recebendo participantes.", ephemeral=True)
+                await interaction.followup.send(
+                    "Esta campanha não está mais recebendo participantes.", ephemeral=True
+                )
                 return
-            asset_id = campaign.asset_id
+
+            existing_discord = await session.execute(
+                select(CampaignParticipant).where(
+                    CampaignParticipant.campaign_id == self.campaign_id,
+                    CampaignParticipant.discord_user_id == interaction.user.id,
+                )
+            )
+            if existing_discord.scalar_one_or_none():
+                await interaction.followup.send("Você já está inscrito nesta campanha.", ephemeral=True)
+                return
+
+            asset_id = int(campaign.asset_id)
             asset_type_id = campaign.asset_type_id
 
         try:
+            # Resolve the username once and reuse this exact user record for
+            # favorite verification; do not send the same POST twice.
             user = await self.bot.roblox.resolve_username(str(self.username.value).strip())
             roblox_id = int(user["id"])
             canonical_username = str(user.get("name") or self.username.value).strip()
+
+            async with self.bot.db.sessions() as session:
+                existing_roblox = await session.execute(
+                    select(CampaignParticipant).where(
+                        CampaignParticipant.campaign_id == self.campaign_id,
+                        CampaignParticipant.roblox_user_id == roblox_id,
+                    )
+                )
+                if existing_roblox.scalar_one_or_none():
+                    await interaction.followup.send(
+                        "Essa conta Roblox já está vinculada a uma participação nesta campanha.",
+                        ephemeral=True,
+                    )
+                    return
+
             verified = await self.bot.roblox.verify_public_favorite(
-                canonical_username, asset_id, asset_type_id, max_pages=20
+                canonical_username,
+                asset_id,
+                asset_type_id,
+                max_pages=20,
+                resolved_user=user,
             )
-        except Exception as exc:
+
+        except RobloxRateLimited as exc:
+            wait_seconds = max(1, int((exc.retry_after or 30) + 0.999))
+            await interaction.followup.send(
+                "O Roblox está limitando temporariamente as consultas. "
+                f"Aguarde aproximadamente **{wait_seconds} segundos** e tente novamente. "
+                "Sua inscrição ainda não foi registrada.",
+                ephemeral=True,
+            )
+            return
+        except RobloxAPIError as exc:
             log.warning("Falha ao validar participante Roblox: %s", exc)
             await interaction.followup.send(
                 f"Não foi possível validar essa conta Roblox: {exc}", ephemeral=True
+            )
+            return
+        except Exception:
+            log.exception("Falha inesperada ao validar participante Roblox")
+            await interaction.followup.send(
+                "Ocorreu uma falha ao validar sua conta Roblox. Tente novamente em instantes.",
+                ephemeral=True,
             )
             return
 
@@ -125,8 +179,13 @@ class RobloxUsernameModal(discord.ui.Modal, title="Confirmar participação"):
             async with self.bot.db.sessions() as session:
                 campaign = await session.get(Campaign, self.campaign_id)
                 if campaign is None or not campaign.is_active:
-                    await interaction.followup.send("Esta campanha foi encerrada durante a verificação.", ephemeral=True)
+                    await interaction.followup.send(
+                        "Esta campanha foi encerrada durante a verificação.", ephemeral=True
+                    )
                     return
+
+                # Re-check both identities inside the final transaction to
+                # prevent two simultaneous submissions from registering twice.
                 existing_discord = await session.execute(
                     select(CampaignParticipant).where(
                         CampaignParticipant.campaign_id == self.campaign_id,
@@ -136,6 +195,7 @@ class RobloxUsernameModal(discord.ui.Modal, title="Confirmar participação"):
                 if existing_discord.scalar_one_or_none():
                     await interaction.followup.send("Você já está inscrito nesta campanha.", ephemeral=True)
                     return
+
                 existing_roblox = await session.execute(
                     select(CampaignParticipant).where(
                         CampaignParticipant.campaign_id == self.campaign_id,
@@ -144,9 +204,11 @@ class RobloxUsernameModal(discord.ui.Modal, title="Confirmar participação"):
                 )
                 if existing_roblox.scalar_one_or_none():
                     await interaction.followup.send(
-                        "Essa conta Roblox já está vinculada a uma participação nesta campanha.", ephemeral=True
+                        "Essa conta Roblox já está vinculada a uma participação nesta campanha.",
+                        ephemeral=True,
                     )
                     return
+
                 session.add(CampaignParticipant(
                     campaign_id=self.campaign_id,
                     guild_id=campaign.guild_id,
@@ -191,10 +253,12 @@ class ClaimPrizeView(discord.ui.View):
                 "Este botão pertence a outro participante.", ephemeral=True
             )
             return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.bot.db.sessions() as session:
             winner = await session.get(CampaignWinner, self.winner_id)
             if winner is None or winner.status != "pending":
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "Esta convocação não está mais disponível.", ephemeral=True
                 )
                 return
@@ -205,8 +269,9 @@ class ClaimPrizeView(discord.ui.View):
             if now > deadline:
                 winner.status = "expired"
                 await session.commit()
-                await interaction.response.send_message(
-                    "O prazo para confirmar o prêmio terminou. Entre em contato com a organização.", ephemeral=True
+                await interaction.followup.send(
+                    "O prazo para confirmar o prêmio terminou. Entre em contato com a organização.",
+                    ephemeral=True,
                 )
                 return
             winner.status = "confirmed"
@@ -217,7 +282,7 @@ class ClaimPrizeView(discord.ui.View):
             position = winner.position
             await session.commit()
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🎉 Confirmação recebida! Você aceitou o **{position}º lugar**. "
             "A organização entrará em contato para entregar o prêmio.",
             ephemeral=True,
@@ -270,25 +335,18 @@ class CampaignPublicView(discord.ui.View):
         self.add_item(participants)
     async def join(self, interaction: discord.Interaction):
         if not interaction.guild_id:
-            await interaction.response.send_message("Use este botão dentro do servidor.", ephemeral=True)
-            return
-        async with self.bot.db.sessions() as session:
-            campaign = await session.get(Campaign, self.campaign_id)
-            if campaign is None or not campaign.is_active:
-                await interaction.response.send_message("Esta campanha foi encerrada.", ephemeral=True)
-                return
-            already = await session.execute(
-                select(CampaignParticipant).where(
-                    CampaignParticipant.campaign_id == self.campaign_id,
-                    CampaignParticipant.discord_user_id == interaction.user.id,
-                )
+            await interaction.response.send_message(
+                "Use este botão dentro do servidor.", ephemeral=True
             )
-            if already.scalar_one_or_none():
-                await interaction.response.send_message("Você já está inscrito nesta campanha.", ephemeral=True)
-                return
-        await interaction.response.send_modal(RobloxUsernameModal(self.bot, self.campaign_id))
+            return
+        # Modals must be the initial response. Database checks happen after
+        # the user submits the modal, which is already deferred immediately.
+        await interaction.response.send_modal(
+            RobloxUsernameModal(self.bot, self.campaign_id)
+        )
 
     async def show_participants(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.bot.db.sessions() as session:
             result = await session.execute(
                 select(CampaignParticipant)
@@ -296,21 +354,27 @@ class CampaignPublicView(discord.ui.View):
                 .order_by(CampaignParticipant.joined_at)
             )
             rows = list(result.scalars().all())
+
         if not rows:
-            await interaction.response.send_message("Ainda não há participantes confirmados.", ephemeral=True)
+            await interaction.followup.send(
+                "Ainda não há participantes confirmados.", ephemeral=True
+            )
             return
+
         lines = [
             f"`{index}.` **{row.roblox_username}** — <@{row.discord_user_id}>"
             for index, row in enumerate(rows[:40], start=1)
         ]
         if len(rows) > 40:
             lines.append(f"... e mais {len(rows) - 40} participantes.")
+
         embed = discord.Embed(
             title=f"👥 Participantes — {len(rows)}",
             description="\n".join(lines)[:4000],
             color=0x5865F2,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 
 async def draw_campaign(bot, campaign_id: int) -> str:
     import secrets
@@ -473,7 +537,7 @@ async def refresh_campaign_counts(bot):
                 "Consultando favoritos da campanha: campaign_id=%s asset_id=%s item=%s",
                 campaign.id, asset_id, campaign.item_name,
             )
-            count = await bot.roblox.get_favorite_count(asset_id, campaign.favorite_count)
+            count = await bot.roblox.get_favorite_count(asset_id, None)
 
             if count is not None:
                 async with bot.db.sessions() as session:
