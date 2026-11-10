@@ -361,10 +361,14 @@ class CampaignPublicView(discord.ui.View):
             )
             return
 
-        lines = [
-            f"`{index}.` **{row.roblox_username}** — <@{row.discord_user_id}>"
-            for index, row in enumerate(rows[:40], start=1)
-        ]
+        lines = []
+        for index, row in enumerate(rows[:40], start=1):
+            entry = f"`{index}.` **{row.roblox_username}**"
+            # Self-registrations retain their Discord identity; manually added
+            # Roblox-only entries intentionally display no Discord mention.
+            if row.discord_user_id is not None:
+                entry += f" — <@{row.discord_user_id}>"
+            lines.append(entry)
         if len(rows) > 40:
             lines.append(f"... e mais {len(rows) - 40} participantes.")
 
@@ -395,7 +399,8 @@ async def draw_campaign(bot, campaign_id: int) -> str:
             )
         )
         if (already_drawn.scalar() or 0) > 0:
-            return "Já existem ganhadores aguardando resposta ou confirmados. Use `/campanha_substituir` se necessário."
+            return "Já existem ganhadores aguardando resposta ou confirmados. Use a opção de substituir se necessário."
+
         participants_result = await session.execute(
             select(CampaignParticipant).where(CampaignParticipant.campaign_id == campaign_id)
         )
@@ -404,15 +409,16 @@ async def draw_campaign(bot, campaign_id: int) -> str:
             select(CampaignWinner.participant_id).where(CampaignWinner.campaign_id == campaign_id)
         )
         excluded = set(excluded_result.scalars().all())
-        eligible = [p for p in participants if p.id not in excluded]
+        eligible = [participant for participant in participants if participant.id not in excluded]
         if len(eligible) < campaign.winner_count:
             return (
                 f"Participantes elegíveis insuficientes. Disponíveis: **{len(eligible)}**; "
                 f"vagas solicitadas: **{campaign.winner_count}**."
             )
+
         selected = secrets.SystemRandom().sample(eligible, campaign.winner_count)
         deadline_minutes = campaign.response_timeout_minutes
-        guild_id = campaign.guild_id
+        channel_id = campaign.channel_id
         item_name = campaign.item_name
         prize_text = campaign.prize_text
         created = []
@@ -429,24 +435,72 @@ async def draw_campaign(bot, campaign_id: int) -> str:
             )
             session.add(winner)
             await session.flush()
-            created.append((winner.id, participant.discord_user_id, participant.roblox_username, position))
+            created.append((
+                winner.id,
+                participant.discord_user_id,
+                participant.roblox_username,
+                position,
+            ))
         await session.commit()
 
+    winner_lines = [
+        f"**{position}º lugar:** `{username}`"
+        for _winner_id, _discord_user_id, username, position in created
+    ]
+    safe_item_name = discord.utils.escape_mentions(item_name)
+    safe_prize_text = discord.utils.escape_mentions(prize_text)
+    announcement = (
+        f"@here\n🎉 **RESULTADO DO SORTEIO — {safe_item_name}**\n"
+        f"🎁 **Prêmio:** {safe_prize_text}\n\n"
+        + "\n".join(winner_lines)
+    )
+    if any(discord_user_id is None for _winner_id, discord_user_id, _username, _position in created):
+        announcement += "\n\n📩 Ganhadores adicionados pela organização: chamem a equipe para combinar a entrega do prêmio."
+    announcement_sent = False
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+        await channel.send(
+            announcement,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=True, users=False, roles=False, replied_user=False
+            ),
+        )
+        announcement_sent = True
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        log.exception(
+            "Não foi possível publicar o resultado do sorteio: campaign_id=%s channel_id=%s",
+            campaign_id,
+            channel_id,
+        )
+
+    # Only self-registered participants have a Discord account linked to the
+    # Roblox identity. Manually added Roblox-only entries are announced in the
+    # campaign channel and are not DM'd or tagged as the administrator.
     for winner_id, discord_user_id, username, position in created:
+        if discord_user_id is None:
+            continue
         try:
             user = await bot.fetch_user(discord_user_id)
             await user.send(
                 f"🎉 Você foi sorteado(a) em **{position}º lugar** na campanha **{item_name}**!\n"
-                f"**Prêmio:** {prize_text}\n"
+                f"**Roblox:** {username}\n**Prêmio:** {prize_text}\n"
                 f"Você tem **{deadline_minutes} minutos** para confirmar o recebimento do prêmio.",
                 view=ClaimPrizeView(bot, winner_id, discord_user_id),
             )
         except (discord.Forbidden, discord.HTTPException):
             log.warning("Não foi possível enviar DM ao vencedor %s", discord_user_id)
-    return (
-        f"🎉 Sorteio realizado! **{len(created)} ganhador(es)** selecionado(s). "
-        "As notificações foram enviadas por mensagem privada quando permitido."
+
+    result = (
+        f"🎉 Sorteio realizado! **{len(created)} ganhador(es)** selecionado(s).\n"
+        + "\n".join(winner_lines)
     )
+    if announcement_sent:
+        result += "\nResultado publicado no canal com @here."
+    else:
+        result += "\n⚠️ Não consegui publicar o anúncio no canal; confira as permissões do bot."
+    return result
 
 
 async def restore_campaign_views(bot):
@@ -466,7 +520,10 @@ async def restore_campaign_views(bot):
         winners_result = await session.execute(
             select(CampaignWinner, CampaignParticipant.discord_user_id)
             .join(CampaignParticipant, CampaignWinner.participant_id == CampaignParticipant.id)
-            .where(CampaignWinner.status == "pending")
+            .where(
+                CampaignWinner.status == "pending",
+                CampaignParticipant.discord_user_id.is_not(None),
+            )
         )
         winners = list(winners_result.all())
 
