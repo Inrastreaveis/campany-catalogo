@@ -50,7 +50,12 @@ class RobloxStoreBot(commands.Bot):
             log.info("Comandos globais sincronizados. A propagação pode demorar.")
 
         await self.restore_panel_views()
-        await restore_campaign_views(self)
+        try:
+            await restore_campaign_views(self)
+        except Exception:
+            # Do not prevent the bot from starting if one persistent-view
+            # restoration pass fails; the traceback will identify the cause.
+            log.exception("Falha geral ao restaurar interações dos painéis de campanhas")
         self.refresh_loop.change_interval(minutes=self.settings.refresh_interval_minutes)
         self.refresh_loop.start()
         self.campaign_refresh_loop.start()
@@ -167,7 +172,7 @@ class RobloxStoreBot(commands.Bot):
     async def before_refresh_loop(self):
         await self.wait_until_ready()
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(minutes=2)
     async def campaign_refresh_loop(self):
         await refresh_campaign_counts(self)
 
