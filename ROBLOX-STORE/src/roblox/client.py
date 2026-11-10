@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 from typing import Any
 
 import aiohttp
@@ -36,7 +37,7 @@ class RobloxClient:
         # catalog count loop and participant verification from hitting the
         # public API in parallel and triggering HTTP 429 responses.
         self._request_lock = asyncio.Lock()
-        self._min_request_interval = 2.5
+        self._min_request_interval = 4.0
         self._last_request_at = 0.0
         self._cooldown_until = 0.0
         self._rate_limit_streak = 0
@@ -82,92 +83,92 @@ class RobloxClient:
         return retry_after
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
-        # Some Roblox experimental endpoints return a scalar or list instead
-        # of an object. Only callers that explicitly opt in may receive it.
+        """Make a serialized Roblox request with bounded automatic 429 retries.
+
+        Every endpoint shares this queue. When Roblox returns HTTP 429, the
+        queue waits for Retry-After (or progressive backoff) and retries the
+        same request before allowing the next caller to proceed.
+        """
         allow_non_object_json = bool(kwargs.pop("_allow_non_object_json", False))
         await self.start()
         assert self.session is not None
 
-        # Serialize ALL requests to Roblox, including username resolution,
-        # favorite counts, thumbnails and public favorite-list checks.
+        max_rate_limit_retries = 2
+        rate_limit_retries = 0
+        csrf_retried = False
+        request_kwargs = dict(kwargs)
+
         async with self._request_lock:
             loop = asyncio.get_running_loop()
-            now = loop.time()
-            cooldown_remaining = self._cooldown_until - now
-            if cooldown_remaining > 0:
-                raise RobloxRateLimited(
-                    "O Roblox está temporariamente limitando as consultas.",
-                    retry_after=cooldown_remaining,
-                )
+            while True:
+                # Wait out a cooldown raised by this or another request instead
+                # of immediately failing every queued verification.
+                cooldown_remaining = self._cooldown_until - loop.time()
+                if cooldown_remaining > 0:
+                    await asyncio.sleep(cooldown_remaining + random.uniform(0.25, 0.75))
 
-            spacing = self._min_request_interval - (now - self._last_request_at)
-            if spacing > 0:
-                await asyncio.sleep(spacing)
+                spacing = self._min_request_interval - (loop.time() - self._last_request_at)
+                if spacing > 0:
+                    await asyncio.sleep(spacing)
 
-            now = loop.time()
-            cooldown_remaining = self._cooldown_until - now
-            if cooldown_remaining > 0:
-                raise RobloxRateLimited(
-                    "O Roblox está temporariamente limitando as consultas.",
-                    retry_after=cooldown_remaining,
-                )
+                # A cooldown may have been extended while spacing elapsed.
+                cooldown_remaining = self._cooldown_until - loop.time()
+                if cooldown_remaining > 0:
+                    await asyncio.sleep(cooldown_remaining + random.uniform(0.25, 0.75))
 
-            self._last_request_at = now
-            try:
-                async with self.session.request(method, url, **kwargs) as response:
-                    if response.status == 429:
-                        body = await response.text()
-                        delay = self._activate_rate_limit(response.headers)
-                        raise RobloxRateLimited(
-                            f"O Roblox limitou temporariamente as consultas: {body[:160]}",
-                            retry_after=delay,
-                        )
-
-                    if response.status == 403 and response.headers.get("x-csrf-token"):
-                        csrf = response.headers["x-csrf-token"]
-                        headers = dict(kwargs.get("headers", {}) or {})
-                        headers["x-csrf-token"] = csrf
-                        retry_kwargs = dict(kwargs)
-                        retry_kwargs["headers"] = headers
-
-                        # Keep the retry inside the same global queue and
-                        # preserve the minimum spacing between requests.
-                        await asyncio.sleep(self._min_request_interval)
-                        self._last_request_at = loop.time()
-                        async with self.session.request(method, url, **retry_kwargs) as retry:
-                            body = await retry.text()
-                            if retry.status == 429:
-                                delay = self._activate_rate_limit(retry.headers)
+                self._last_request_at = loop.time()
+                try:
+                    async with self.session.request(method, url, **request_kwargs) as response:
+                        if response.status == 429:
+                            body = await response.text()
+                            delay = self._activate_rate_limit(response.headers)
+                            if rate_limit_retries >= max_rate_limit_retries:
                                 raise RobloxRateLimited(
-                                    "O Roblox limitou temporariamente as consultas.",
+                                    f"O Roblox continua limitando as consultas: {body[:160]}",
                                     retry_after=delay,
                                 )
-                            if retry.status == 404:
-                                raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
-                            if retry.status >= 400:
-                                raise RobloxAPIError(
-                                    f"Roblox respondeu HTTP {retry.status}: {body[:200]}"
-                                )
-                            self._rate_limit_streak = 0
-                            return self._decode_json(body, allow_non_object=allow_non_object_json)
+                            rate_limit_retries += 1
+                            log.warning(
+                                "Roblox 429: repetindo automaticamente %s %s após %.1fs "
+                                "(tentativa %s/%s)",
+                                method,
+                                url,
+                                delay,
+                                rate_limit_retries,
+                                max_rate_limit_retries,
+                            )
+                            continue
 
-                    body = await response.text()
-                    if response.status == 404:
-                        raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
-                    if response.status >= 400:
-                        raise RobloxAPIError(
-                            f"Roblox respondeu HTTP {response.status}: {body[:200]}"
-                        )
+                        if (
+                            response.status == 403
+                            and response.headers.get("x-csrf-token")
+                            and not csrf_retried
+                        ):
+                            headers = dict(request_kwargs.get("headers", {}) or {})
+                            headers["x-csrf-token"] = response.headers["x-csrf-token"]
+                            request_kwargs = dict(request_kwargs)
+                            request_kwargs["headers"] = headers
+                            csrf_retried = True
+                            log.debug("Roblox solicitou token CSRF; repetindo a requisição com o token recebido")
+                            continue
 
-                    self._rate_limit_streak = 0
-                    return self._decode_json(body, allow_non_object=allow_non_object_json)
+                        body = await response.text()
+                        if response.status == 404:
+                            raise RobloxNotFound("O item ou usuário não foi encontrado no Roblox.")
+                        if response.status >= 400:
+                            raise RobloxAPIError(
+                                f"Roblox respondeu HTTP {response.status}: {body[:200]}"
+                            )
 
-            except RobloxRateLimited:
-                raise
-            except asyncio.TimeoutError as exc:
-                raise RobloxAPIError("A API do Roblox demorou demais para responder.") from exc
-            except aiohttp.ClientError as exc:
-                raise RobloxAPIError(f"Falha de comunicação com o Roblox: {exc}") from exc
+                        self._rate_limit_streak = 0
+                        return self._decode_json(body, allow_non_object=allow_non_object_json)
+
+                except RobloxRateLimited:
+                    raise
+                except asyncio.TimeoutError as exc:
+                    raise RobloxAPIError("A API do Roblox demorou demais para responder.") from exc
+                except aiohttp.ClientError as exc:
+                    raise RobloxAPIError(f"Falha de comunicação com o Roblox: {exc}") from exc
 
     @staticmethod
     def _decode_json(body: str, allow_non_object: bool = False) -> Any:
