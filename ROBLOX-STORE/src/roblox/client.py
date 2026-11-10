@@ -94,6 +94,59 @@ class RobloxClient:
             raise RobloxNotFound("O Roblox retornou um produto diferente do ID solicitado.")
         return item
 
+    @staticmethod
+    def _extract_favorite_count(payload: Any) -> int | None:
+        """Extract a non-negative favorite count from known Roblox response shapes."""
+        count_keys = (
+            "count",
+            "favorites",
+            "favoriteCount",
+            "favoritesCount",
+            "totalFavorites",
+            "total_favorites",
+            "favorite_count",
+            "totalCount",
+            "Count",
+            "value",
+        )
+        envelope_keys = ("data", "result", "response")
+
+        if isinstance(payload, bool) or payload is None:
+            return None
+
+        if isinstance(payload, int):
+            return payload if payload >= 0 else None
+
+        if isinstance(payload, float):
+            return int(payload) if payload >= 0 and payload.is_integer() else None
+
+        if isinstance(payload, str):
+            value = payload.strip()
+            if value.isdecimal():
+                return int(value)
+            return None
+
+        if isinstance(payload, dict):
+            for key in count_keys:
+                if key in payload:
+                    found = RobloxClient._extract_favorite_count(payload[key])
+                    if found is not None:
+                        return found
+            for key in envelope_keys:
+                if key in payload:
+                    found = RobloxClient._extract_favorite_count(payload[key])
+                    if found is not None:
+                        return found
+            return None
+
+        if isinstance(payload, list):
+            for item in payload:
+                found = RobloxClient._extract_favorite_count(item)
+                if found is not None:
+                    return found
+
+        return None
+
     async def get_favorite_count(self, asset_id: int, fallback: int | None = None) -> int | None:
         try:
             data = await self._request(
@@ -101,38 +154,19 @@ class RobloxClient:
                 f"{CATALOG}/v1/favorites/assets/{asset_id}/count",
                 _allow_non_object_json=True,
             )
+            count = self._extract_favorite_count(data)
+            if count is not None:
+                log.info("Favoritos do item Roblox %s atualizados: %s", asset_id, count)
+                return count
 
-            # Roblox documents this experimental endpoint as a count model,
-            # but responses may be scalar or wrapped depending on the edge.
-            candidates = [data]
             if isinstance(data, dict):
-                candidates.extend([
-                    data.get("count"),
-                    data.get("favoriteCount"),
-                    data.get("data"),
-                    data.get("Count"),
-                ])
-            elif isinstance(data, list):
-                candidates.extend(data[:3])
-
-            for candidate in candidates:
-                if isinstance(candidate, dict):
-                    candidate = candidate.get(
-                        "count",
-                        candidate.get("favoriteCount", candidate.get("Count")),
-                    )
-                if candidate is None or isinstance(candidate, bool):
-                    continue
-                try:
-                    count = int(candidate)
-                    if count >= 0:
-                        return count
-                except (TypeError, ValueError):
-                    continue
-
+                shape = f"object keys={list(data.keys())[:20]}"
+            else:
+                shape = f"type={type(data).__name__}"
             log.warning(
-                "Resposta de favoritos sem contador reconhecível para o item %s: %r",
+                "Resposta de favoritos sem contador reconhecível para o item %s (%s): %r",
                 asset_id,
+                shape,
                 data,
             )
             return fallback
