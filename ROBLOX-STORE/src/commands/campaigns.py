@@ -246,10 +246,12 @@ class CampaignCommands(commands.Cog):
         if not rows:
             await interaction.response.send_message("Ainda não há participantes confirmados.", ephemeral=True)
             return
-        lines = [
-            f"`{i}.` **{p.roblox_username}** — <@{p.discord_user_id}> (`{p.roblox_user_id}`)"
-            for i, p in enumerate(rows[:60], start=1)
-        ]
+        lines = []
+        for i, participant in enumerate(rows[:60], start=1):
+            entry = f"`{i}.` **{participant.roblox_username}**"
+            if participant.discord_user_id is not None:
+                entry += f" — <@{participant.discord_user_id}>"
+            lines.append(entry)
         if len(rows) > 60:
             lines.append(f"... e mais {len(rows) - 60} participantes.")
         embed = discord.Embed(
@@ -357,18 +359,37 @@ class CampaignCommands(commands.Cog):
             item_name = campaign.item_name
             prize_text = campaign.prize_text
             timeout = campaign.response_timeout_minutes
+            channel_id = campaign.channel_id
             await session.commit()
 
+        if discord_user_id is not None:
+            try:
+                user = await self.bot.fetch_user(discord_user_id)
+                view = ClaimPrizeView(self.bot, winner_id, discord_user_id)
+                await user.send(
+                    f"🎉 Você foi selecionado(a) como substituto(a) do **{posicao}º lugar** "
+                    f"na campanha **{item_name}**!\n**Roblox:** {username}\n"
+                    f"**Prêmio:** {prize_text}\nVocê tem **{timeout} minutos** para responder.",
+                    view=view,
+                )
+                self.bot.add_view(view)
+            except (discord.Forbidden, discord.HTTPException):
+                log.warning("Não foi possível enviar DM ao vencedor substituto %s", discord_user_id)
+
         try:
-            user = await self.bot.fetch_user(discord_user_id)
-            await user.send(
-                f"🎉 Você foi selecionado(a) como substituto(a) do **{posicao}º lugar** "
-                f"na campanha **{item_name}**!\n**Prêmio:** {prize_text}\nVocê tem **{timeout} minutos** para responder.",
-                view=ClaimPrizeView(self.bot, winner_id, discord_user_id),
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            await channel.send(
+                f"@here\n🔁 **NOVO GANHADOR — {discord.utils.escape_mentions(item_name)}**\n**{posicao}º lugar:** `{discord.utils.escape_mentions(username)}`",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=True, users=False, roles=False, replied_user=False
+                ),
             )
-        except (discord.Forbidden, discord.HTTPException):
-            log.warning("Não foi possível enviar DM ao vencedor substituto %s", discord_user_id)
-        self.bot.add_view(ClaimPrizeView(self.bot, winner_id, discord_user_id))
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            log.exception(
+                "Não foi possível anunciar o ganhador substituto da campanha %s",
+                campaign_id,
+            )
+
         await interaction.followup.send(
             f"✅ Novo participante sorteado para o **{posicao}º lugar**: **{username}**. "
             "A convocação foi registrada.",
